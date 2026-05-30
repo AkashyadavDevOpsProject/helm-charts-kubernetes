@@ -1,0 +1,33 @@
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "devsecops-pipeline.fullname" . }}
+  labels:
+    {{- include "devsecops-pipeline.labels" . | nindent 4 }}
+rules:
+  # The GitLab Kubernetes executor creates and monitors pods for each CI job.
+  # These permissions are scoped to the release namespace via the ClusterRoleBinding.
+  - apiGroups: [""]
+    resources: ["pods", "pods/exec", "pods/attach", "pods/log"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "create", "delete", "update"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "create", "delete", "update"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  # Allow runners to read ServiceAccounts for attaching IRSA annotations to job pods.
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["get", "list"]
+{{- end }}

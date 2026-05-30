@@ -1,0 +1,267 @@
+# ------------------------------------------------------------------------------
+# eks-autoscaler Helm chart values
+# Prerequisites:
+#   - Karpenter installed in the cluster (karpenter namespace)
+#   - SQS queue created for Spot interruption events
+#   - IAM roles for Karpenter controller and node instance profile
+#   - Karpenter CRDs installed (NodePool, EC2NodeClass)
+# ------------------------------------------------------------------------------
+
+# nameOverride: Overrides the chart name portion of generated resource names.
+nameOverride: ""
+# fullnameOverride: Completely overrides the generated resource name.
+fullnameOverride: ""
+
+# ──────────────────────────────────────────────
+# Karpenter NodePool + EC2NodeClass configuration
+# ──────────────────────────────────────────────
+karpenter:
+  # clusterName: REQUIRED. Must match the EKS cluster name exactly.
+  # Karpenter uses this to tag and discover nodes.
+  clusterName: ""
+
+  # clusterEndpoint: REQUIRED. EKS API server endpoint URL.
+  # Get it with: aws eks describe-cluster --name CLUSTER_NAME --query cluster.endpoint
+  clusterEndpoint: ""
+
+  # interruptionQueue: REQUIRED. SQS queue name for Spot interruption events.
+  # Create with: aws sqs create-queue --queue-name CLUSTER_NAME-karpenter-interruption
+  # Karpenter watches this queue to gracefully drain nodes before termination.
+  interruptionQueue: ""
+
+  nodePools:
+    general:
+      # enabled: Deploy the On-Demand general-purpose NodePool.
+      # Use for system workloads, stateful services, and anything that must not be interrupted.
+      enabled: true
+
+      # instanceTypes: EC2 instance families for this pool.
+      # Graviton3 (m7g) first for best price/perf. Graviton2 (m6g) as fallback.
+      # Diverse families improve availability — Karpenter picks the cheapest available.
+      instanceTypes:
+        - m7g.medium
+        - m7g.large
+        - m7g.xlarge
+        - m7g.2xlarge
+        - m6g.medium
+        - m6g.large
+        - m6g.xlarge
+
+      # capacityType: on-demand for general workloads — no interruption risk.
+      capacityType:
+        - on-demand
+
+      # amiFamily: AL2023 is required for EKS 1.29+ Graviton nodes.
+      # Provides better security defaults and systemd-based init.
+      amiFamily: AL2023
+
+      # volumeSize: Root EBS volume size per node.
+      # 50Gi accommodates container image layers for most workloads.
+      volumeSize: 50Gi
+
+      # volumeType: gp3 provides better IOPS at lower cost than gp2.
+      volumeType: gp3
+
+      # encrypted: Always true — required for SOC 2 compliance.
+      encrypted: true
+
+      # imdsHopLimit: CRITICAL. Must be 2 for EKS pods to access IMDS.
+      # AL2023 default is 1, which blocks pod IRSA token requests.
+      # Without this, pods with IRSA annotations will fail to authenticate with AWS.
+      imdsHopLimit: 2
+
+      limits:
+        # cpu: Maximum total vCPU across all nodes in this pool.
+        # Prevents runaway scaling from a misconfigured HPA.
+        cpu: "100"
+        # memory: Maximum total memory across all nodes in this pool.
+        memory: 400Gi
+
+      disruption:
+        # consolidationPolicy: Remove underutilized nodes to reduce costs.
+        consolidationPolicy: WhenUnderutilized
+        # consolidateAfter: Wait this long before consolidating an underutilized node.
+        # 30s is aggressive — increase to 5m for workloads with frequent scaling.
+        consolidateAfter: 30s
+
+      # weight: When multiple NodePools match, higher weight is preferred.
+      # On-Demand pool has lower weight so Spot is preferred where possible.
+      weight: 10
+
+    spot:
+      # enabled: Deploy the Spot NodePool for cost-optimized batch/stateless workloads.
+      # Spot nodes can be 60-90% cheaper than On-Demand. Use for tolerant workloads.
+      enabled: true
+
+      # instanceTypes: Wide family diversity is critical for Spot availability.
+      # When one family is reclaimed en masse, others remain available.
+      instanceTypes:
+        - m7g.medium
+        - m7g.large
+        - m7g.xlarge
+        - m7g.2xlarge
+        - m6g.medium
+        - m6g.large
+        - m6g.xlarge
+        - c7g.large
+        - c7g.xlarge
+        - c6g.large
+        - c6g.xlarge
+        - r7g.medium
+        - r6g.medium
+
+      # capacityType: spot for maximum cost savings.
+      capacityType:
+        - spot
+
+      amiFamily: AL2023
+      volumeSize: 50Gi
+      volumeType: gp3
+      encrypted: true
+      imdsHopLimit: 2
+
+      limits:
+        # cpu: Spot pool gets 2x the CPU budget — Spot is cheaper, use more of it.
+        cpu: "200"
+        memory: 800Gi
+
+      disruption:
+        # WhenEmpty: Only consolidate Spot nodes when they have no pods.
+        # More conservative than WhenUnderutilized — avoids unnecessary Spot churn.
+        consolidationPolicy: WhenEmpty
+        consolidateAfter: 60s
+
+      # weight: Higher weight than On-Demand so Karpenter prefers Spot first.
+      weight: 50
+
+    gpu:
+      # enabled: Set true only for ML/AI or GPU-accelerated workloads.
+      # GPU nodes are expensive — keep disabled unless actively needed.
+      enabled: false
+
+      # instanceTypes: g4dn (NVIDIA T4), g5 (NVIDIA A10G).
+      # Include multiple sizes so Karpenter can bin-pack GPU workloads.
+      instanceTypes:
+        - g4dn.xlarge
+        - g4dn.2xlarge
+        - g4dn.4xlarge
+        - g5.xlarge
+        - g5.2xlarge
+
+      # capacityType: GPU Spot availability is limited — use On-Demand for reliability.
+      capacityType:
+        - on-demand
+
+      amiFamily: AL2023
+      # volumeSize: Larger root volume for GPU driver overlays and model caches.
+      volumeSize: 100Gi
+      volumeType: gp3
+      encrypted: true
+      imdsHopLimit: 2
+
+      # taints: GPU nodes are tainted so only GPU workloads schedule here.
+      # Pods must have a matching toleration to run on these nodes.
+      taints:
+        - key: nvidia.com/gpu
+          value: "true"
+          effect: NoSchedule
+
+      limits:
+        cpu: "50"
+        memory: 200Gi
+
+      disruption:
+        consolidationPolicy: WhenEmpty
+        consolidateAfter: 300s
+
+      weight: 5
+
+# ──────────────────────────────────────────────
+# EC2NodeClass — AWS-specific node configuration
+# ──────────────────────────────────────────────
+ec2NodeClass:
+  # amiSelectorTerms: How Karpenter selects the AMI for new nodes.
+  # al2023@latest always selects the latest EKS-optimized AL2023 AMI.
+  # Pin to a specific version for production stability.
+  amiSelectorTerms:
+    - alias: al2023@latest
+
+  # role: REQUIRED. EC2 instance IAM role NAME (not ARN) for node instance profile.
+  # This role must have the AmazonEKSWorkerNodePolicy and AmazonEC2ContainerRegistryReadOnly policies.
+  # Do NOT include the arn:aws:iam:: prefix here — Karpenter derives the full ARN.
+  role: ""
+
+  # subnetSelectorTerms: How Karpenter discovers subnets to launch nodes into.
+  # The tag value must match your cluster name exactly.
+  subnetSelectorTerms:
+    - tags:
+        # karpenter.sh/discovery: Tag value must equal the EKS cluster name.
+        karpenter.sh/discovery: ""
+
+  # securityGroupSelectorTerms: Security groups to attach to new nodes.
+  # These must allow all required node-to-node and node-to-control-plane traffic.
+  securityGroupSelectorTerms:
+    - tags:
+        # karpenter.sh/discovery: Tag value must equal the EKS cluster name.
+        karpenter.sh/discovery: ""
+
+  # tags: Resource tags applied to all EC2 instances launched by Karpenter.
+  # Use these for cost allocation, compliance tagging, and resource tracking.
+  tags:
+    # Environment: Tag with your environment name (e.g. production, staging).
+    Environment: ""
+    ManagedBy: karpenter
+    # CostCenter: Tag for AWS Cost Explorer cost allocation.
+    CostCenter: ""
+
+# ──────────────────────────────────────────────
+# HPA default configuration
+# Applied as defaults when HPA resources are deployed separately.
+# These values are informational — actual HPAs live in application charts.
+# ──────────────────────────────────────────────
+hpa:
+  defaults:
+    # minReplicas: Recommended minimum for production HA deployments.
+    minReplicas: 2
+    # maxReplicas: Upper bound to prevent runaway scaling.
+    maxReplicas: 20
+    # cpuThreshold: Scale up when CPU exceeds this percentage.
+    cpuThreshold: 70
+    # memoryThreshold: Scale up when memory exceeds this percentage.
+    memoryThreshold: 80
+    # scaleDownStabilizationWindowSeconds: Prevent flapping by delaying scale-down.
+    scaleDownStabilizationWindowSeconds: 300
+
+# ──────────────────────────────────────────────
+# VPA — Vertical Pod Autoscaler
+# ──────────────────────────────────────────────
+vpa:
+  # enabled: Set true to deploy a VPA resource for recommendation mode.
+  # CAUTION: Use updateMode: "Off" first to gather recommendations without
+  # applying them. Review recommendations before enabling Auto mode.
+  enabled: false
+
+  # updateMode: Controls whether VPA applies recommendations automatically.
+  # "Off": recommendations only, no pod restarts (safe to enable immediately)
+  # "Initial": applies recommendations only to new pods
+  # "Auto": applies recommendations and restarts pods — use with caution
+  updateMode: "Off"
+
+  # targetRef: The Deployment that VPA should analyze.
+  # Override this per-deployment when deploying multiple VPA resources.
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ""
+
+  resourcePolicy:
+    containerPolicies:
+      - containerName: "*"
+        # minAllowed: VPA will never recommend below these values.
+        minAllowed:
+          cpu: 50m
+          memory: 64Mi
+        # maxAllowed: VPA will never recommend above these values.
+        maxAllowed:
+          cpu: 4000m
+          memory: 8Gi

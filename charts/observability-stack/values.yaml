@@ -1,0 +1,240 @@
+# ------------------------------------------------------------------------------
+# observability-stack Helm chart values
+# Run `helm dependency update charts/observability-stack/` before install.
+# Sensitive values (adminPassword, api_url, service_key) must be set via
+# --set or an existing Kubernetes secret — never commit them to source control.
+# ------------------------------------------------------------------------------
+
+# nameOverride: Overrides the chart name portion of generated resource names.
+nameOverride: ""
+# fullnameOverride: Completely overrides the generated resource name.
+fullnameOverride: ""
+
+# namespace: Kubernetes namespace for all observability resources.
+# Default: the namespace used at install time (--namespace flag).
+namespace: ""
+
+# ──────────────────────────────────────────────
+# Prometheus sub-chart values
+# Full reference: https://github.com/prometheus-community/helm-charts/tree/main/charts/prometheus
+# ──────────────────────────────────────────────
+prometheus:
+  # enabled: Deploy Prometheus as part of this stack.
+  enabled: true
+
+  server:
+    # retention: How long to keep metric data. Increase for longer trend analysis.
+    # 15d is a good balance between storage cost and historical visibility.
+    retention: 15d
+
+    # persistentVolume: Prometheus TSDB storage configuration.
+    persistentVolume:
+      enabled: true
+      # storageClass: Must exist in the cluster before install.
+      # Use gp3 on EKS — better baseline IOPS than gp2 at lower cost.
+      storageClass: gp3
+      # size: 50Gi supports ~2M active series for 15 days.
+      # Increase for high-cardinality environments (many microservices/labels).
+      size: 50Gi
+
+    # resources: Prometheus server resource allocation.
+    # In production, Prometheus is memory-hungry — size based on series count.
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        cpu: 2000m
+        memory: 4Gi
+
+  # alertmanager: Embedded Alertmanager configuration.
+  alertmanager:
+    # enabled: Deploy Alertmanager for routing and deduplicating alerts.
+    enabled: true
+
+    # config: Full Alertmanager configuration (rendered as alertmanager.yml).
+    config:
+      global:
+        # resolve_timeout: How long to wait before marking an alert as resolved.
+        resolve_timeout: 5m
+      receivers:
+        - name: slack
+          slack_configs:
+            - # api_url: REQUIRED if using Slack. Slack Incoming Webhook URL.
+              # Set via: --set prometheus.alertmanager.config.receivers[0].slack_configs[0].api_url=https://...
+              api_url: ""
+              channel: "#alerts"
+              title: '[{{ .Status | toUpper }}] {{ .GroupLabels.alertname }}'
+              text: '{{ range .Alerts }}{{ .Annotations.description }}{{ end }}'
+              send_resolved: true
+        - name: pagerduty
+          pagerduty_configs:
+            - # service_key: PagerDuty integration key. Leave empty to disable.
+              service_key: ""
+        - name: "null"
+      route:
+        # group_by: Alert dimensions used for grouping into notifications.
+        group_by: [alertname, namespace, severity]
+        # group_wait: Time to buffer alerts before sending first notification.
+        group_wait: 30s
+        # group_interval: Minimum time between notifications for the same group.
+        group_interval: 5m
+        # repeat_interval: How long before re-sending a firing alert.
+        repeat_interval: 12h
+        # receiver: Default receiver for all alerts.
+        receiver: slack
+        routes:
+          - match:
+              # Critical alerts go to PagerDuty for immediate on-call escalation.
+              severity: critical
+            receiver: pagerduty
+
+  # serviceMonitor: Enable ServiceMonitor CRD support for scrape target discovery.
+  # Requires Prometheus Operator CRDs to be installed in the cluster.
+  serverFiles:
+    prometheus.yml:
+      scrape_configs:
+        - job_name: prometheus
+          static_configs:
+            - targets:
+                - localhost:9090
+
+# ──────────────────────────────────────────────
+# Grafana sub-chart values
+# Full reference: https://github.com/grafana/helm-charts/tree/main/charts/grafana
+# ──────────────────────────────────────────────
+grafana:
+  # enabled: Deploy Grafana as part of this stack.
+  enabled: true
+
+  # adminPassword: REQUIRED. Grafana admin user password.
+  # Set via: --set grafana.adminPassword=yourpassword
+  # Or use grafana.admin.existingSecret to reference a pre-created secret.
+  adminPassword: ""
+
+  persistence:
+    # enabled: Persist Grafana data (dashboards, users, plugins) to a PVC.
+    enabled: true
+    # storageClassName: Use gp3 on EKS.
+    storageClassName: gp3
+    # size: 10Gi is sufficient for dashboards and Grafana metadata.
+    size: 10Gi
+
+  # datasources: Pre-configure Prometheus and Loki as default data sources.
+  # These are provisioned automatically on startup — no manual UI setup needed.
+  datasources:
+    datasources.yaml:
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          # url: Internal Kubernetes DNS for Prometheus server.
+          # Default assumes release name 'observability'. Override if different.
+          url: http://observability-prometheus-server
+          isDefault: true
+          access: proxy
+          jsonData:
+            timeInterval: 30s
+        - name: Loki
+          type: loki
+          # url: Internal Kubernetes DNS for Loki.
+          # Default assumes release name 'observability'. Override if different.
+          url: http://observability-loki:3100
+          access: proxy
+
+  # dashboardProviders: Configure where Grafana looks for JSON dashboard files.
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: default
+          orgId: 1
+          # folder: Dashboards will appear under this folder in the Grafana UI.
+          folder: Production
+          type: file
+          # disableDeletion: Prevent dashboards from being deleted via the UI.
+          disableDeletion: true
+          options:
+            path: /var/lib/grafana/dashboards/default
+
+  # resources: Grafana server resource allocation.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  # grafana.ini: Grafana server configuration overrides.
+  grafana.ini:
+    server:
+      # root_url: Set to your Grafana ingress URL in production.
+      root_url: ""
+    auth.anonymous:
+      # enabled: Set false in production — require login for all access.
+      enabled: false
+    security:
+      # allow_embedding: Set true only if embedding dashboards in internal tools.
+      allow_embedding: false
+
+# ──────────────────────────────────────────────
+# Loki sub-chart values
+# Full reference: https://github.com/grafana/helm-charts/tree/main/charts/loki
+# ──────────────────────────────────────────────
+loki:
+  # enabled: Deploy Loki for log aggregation and query.
+  enabled: true
+
+  # loki.commonConfig: Loki server configuration.
+  loki:
+    auth_enabled: false
+    commonConfig:
+      replication_factor: 1
+    storage:
+      # type: filesystem for single-node. Switch to s3 for production HA Loki.
+      type: filesystem
+
+  # singleBinary: Deploy Loki in single-binary mode (simpler, suitable for EKS).
+  singleBinary:
+    replicas: 1
+    persistence:
+      # enabled: Persist Loki log data to a PVC.
+      enabled: true
+      # storageClass: Use gp3 on EKS.
+      storageClass: gp3
+      # size: Scale based on log volume. 50Gi handles ~5GB/day for 10 days.
+      size: 50Gi
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+
+  # test: Disable Loki test pod — not needed in production.
+  test:
+    enabled: false
+
+  # monitoring: Disable Loki's self-monitoring (use Prometheus instead).
+  monitoring:
+    selfMonitoring:
+      enabled: false
+      grafanaAgent:
+        installOperator: false
+
+# ──────────────────────────────────────────────
+# RabbitMQ ServiceMonitor (optional)
+# ──────────────────────────────────────────────
+rabbitmq:
+  monitoring:
+    # enabled: Set true to deploy a ServiceMonitor for RabbitMQ metrics.
+    # Requires RabbitMQ to be deployed with the Prometheus plugin enabled.
+    enabled: false
+    # namespace: Namespace where RabbitMQ is running.
+    namespace: ""
+    # serviceSelector: Labels used to find the RabbitMQ metrics service.
+    serviceSelector:
+      matchLabels:
+        app.kubernetes.io/name: rabbitmq

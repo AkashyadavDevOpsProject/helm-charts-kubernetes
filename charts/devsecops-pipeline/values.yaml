@@ -1,0 +1,238 @@
+# ------------------------------------------------------------------------------
+# devsecops-pipeline Helm chart values
+# Sensitive values (runnerToken, vault.agent.role) must be set via --set
+# or existingSecret — never commit them to source control.
+# ------------------------------------------------------------------------------
+
+# nameOverride: Overrides the chart name portion of generated resource names.
+nameOverride: ""
+# fullnameOverride: Completely overrides the generated resource name.
+fullnameOverride: ""
+
+# ──────────────────────────────────────────────
+# GitLab Runner configuration
+# ──────────────────────────────────────────────
+gitlab:
+  runner:
+    # enabled: Set false to skip deploying the GitLab Runner.
+    enabled: true
+
+    # replicas: Number of runner manager pods.
+    # Scale up for more concurrent pipeline capacity (each pod handles `concurrent` jobs).
+    replicas: 3
+
+    # gitlabUrl: REQUIRED. URL of your GitLab instance.
+    # Example: https://gitlab.example.com or https://gitlab.com
+    gitlabUrl: ""
+
+    # runnerToken: REQUIRED unless existingSecret is set.
+    # GitLab runner registration token from Settings → CI/CD → Runners.
+    # Set via: --set gitlab.runner.runnerToken=glrt-xxxxxxxxxxxx
+    runnerToken: ""
+
+    # existingSecret: Name of a pre-existing Kubernetes Secret containing the runner token.
+    # Secret must have key 'runner-token'. When set, runnerToken above is ignored.
+    existingSecret: ""
+
+    # concurrent: Maximum number of jobs that can run simultaneously per runner pod.
+    # Total cluster concurrency = replicas × concurrent.
+    concurrent: 10
+
+    # checkInterval: How often (seconds) the runner polls GitLab for new jobs.
+    checkInterval: 3
+
+    image:
+      registry: registry.gitlab.com
+      image: gitlab-org/gitlab-runner
+      # tag: Pin to a specific version. Alpine variant for smaller image size.
+      tag: alpine-v16.9.0
+      pullPolicy: IfNotPresent
+
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        # cpu: Allow burst during job dispatching — runners are bursty by nature.
+        cpu: 1000m
+        memory: 1Gi
+
+    # sessionServer: Enable interactive terminal access to running jobs.
+    sessionServer:
+      enabled: false
+
+    # config: GitLab runner config.toml content — rendered into a ConfigMap.
+    # The [[runners]] block is the primary runner configuration.
+    config: |
+      concurrent = {{ .Values.gitlab.runner.concurrent }}
+      check_interval = {{ .Values.gitlab.runner.checkInterval }}
+      shutdown_timeout = 30
+
+      [session_server]
+        session_timeout = 1800
+
+      [[runners]]
+        url = "{{ .Values.gitlab.runner.gitlabUrl }}"
+        executor = "kubernetes"
+        environment = ["FF_USE_ADVANCED_POD_SPEC_CONFIGURATION=true"]
+
+        [runners.kubernetes]
+          namespace = "{{ .Release.Namespace }}"
+          image = "alpine:3.19"
+          pull_policy = "always"
+          service_account = "{{ include "devsecops-pipeline.serviceAccountName" . }}"
+          privileged = false
+
+          cpu_request = "100m"
+          cpu_limit = "2000m"
+          memory_request = "128Mi"
+          memory_limit = "2Gi"
+
+          [runners.kubernetes.pod_labels]
+            "app" = "gitlab-runner-job"
+            "managed-by" = "gitlab-runner"
+
+          [runners.kubernetes.pod_security_context]
+            run_as_non_root = true
+            run_as_user = 1000
+
+          [runners.kubernetes.volumes]
+
+            [[runners.kubernetes.volumes.empty_dir]]
+              name = "tmp"
+              mount_path = "/tmp"
+
+# ──────────────────────────────────────────────
+# Trivy — container image vulnerability scanner
+# ──────────────────────────────────────────────
+trivy:
+  # enabled: Deploy Trivy as a ConfigMap-based scan helper for pipeline jobs.
+  # Jobs reference the trivy image to scan images as a pipeline stage.
+  enabled: true
+
+  image:
+    repository: aquasec/trivy
+    # tag: Pin to a specific release. Trivy DB is updated independently of the image.
+    tag: "0.49.0"
+    pullPolicy: IfNotPresent
+
+  # severity: Comma-separated list of severities that will fail the pipeline.
+  # LOW and MEDIUM are reported but do not cause pipeline failure.
+  severity: "HIGH,CRITICAL"
+
+  # exitCode: Exit code Trivy returns when findings at or above severity are found.
+  # 1 causes the CI job to fail; 0 reports but does not fail.
+  exitCode: 1
+
+  # ignoreUnfixed: Do not fail on vulnerabilities with no available fix.
+  # Reduces noise from OS packages that cannot be patched yet.
+  ignoreUnfixed: true
+
+  # timeout: Maximum time allowed for a single image scan.
+  timeout: "5m"
+
+  # cacheDir: Trivy vulnerability DB cache directory.
+  # Must be writable — use /tmp since containers run with readOnlyRootFilesystem.
+  cacheDir: "/tmp/trivy"
+
+# ──────────────────────────────────────────────
+# HashiCorp Vault agent injector
+# ──────────────────────────────────────────────
+vault:
+  agent:
+    # enabled: Set true to inject the Vault agent sidecar into runner pods.
+    # Requires Vault with Kubernetes auth method enabled.
+    enabled: false
+
+    # address: REQUIRED if enabled. Full URL of the Vault server.
+    # Example: https://vault.internal.example.com:8200
+    address: ""
+
+    # role: REQUIRED if enabled. Vault Kubernetes auth role name.
+    # This role must be configured in Vault with the runner's ServiceAccount.
+    role: ""
+
+    # authPath: Vault Kubernetes authentication mount path.
+    # Default is 'kubernetes' — change if Vault uses a custom mount.
+    authPath: kubernetes
+
+    # namespace: Vault namespace (Enterprise only). Leave empty for open-source Vault.
+    namespace: ""
+
+    image:
+      repository: hashicorp/vault
+      # tag: Pin to a specific Vault version for reproducible builds.
+      tag: "1.15.0"
+      pullPolicy: IfNotPresent
+
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+
+# ──────────────────────────────────────────────
+# OPA Gatekeeper policies
+# ──────────────────────────────────────────────
+opa:
+  # enabled: Deploy OPA Gatekeeper ConstraintTemplates and Constraints as a ConfigMap.
+  # Actual enforcement requires OPA Gatekeeper to be installed in the cluster.
+  enabled: true
+
+  policies:
+    # requireNonRootUser: Block containers that run as root (UID 0).
+    requireNonRootUser: true
+
+    # requireReadOnlyRootFS: Block containers with writable root filesystems.
+    requireReadOnlyRootFS: true
+
+    # blockLatestTag: Block deployments using the :latest image tag.
+    # Prevents non-reproducible builds in production namespaces.
+    blockLatestTag: true
+
+    # requireResourceLimits: Block pods without CPU and memory limits.
+    # Prevents resource exhaustion and improves scheduler accuracy.
+    requireResourceLimits: true
+
+    # requireTrustedRegistry: Block images from registries not in the allow list.
+    # Set true and populate trustedRegistries to enforce image provenance.
+    requireTrustedRegistry: false
+
+    # trustedRegistries: List of allowed container registry prefixes.
+    # Only used when requireTrustedRegistry is true.
+    # Example: ["123456789.dkr.ecr.ap-south-1.amazonaws.com", "registry.gitlab.com"]
+    trustedRegistries: []
+
+# ──────────────────────────────────────────────
+# ServiceAccount and RBAC
+# ──────────────────────────────────────────────
+serviceAccount:
+  # create: Create a ServiceAccount for the runner manager pods.
+  create: true
+  # annotations: Use for IRSA to grant AWS API access without static credentials.
+  # Example: eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT:role/gitlab-runner-role
+  annotations: {}
+  # name: ServiceAccount name. Auto-generated if empty.
+  name: ""
+
+rbac:
+  # create: Create ClusterRole and ClusterRoleBinding for the runner.
+  # The runner needs permission to create/delete pods and read secrets
+  # in the release namespace for Kubernetes executor job pods.
+  create: true
+
+podSecurityContext:
+  # runAsNonRoot: Runner manager pod must not run as root.
+  runAsNonRoot: true
+  # runAsUser: UID 1000 is the GitLab runner default non-root user.
+  runAsUser: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL

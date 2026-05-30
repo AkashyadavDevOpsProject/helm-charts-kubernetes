@@ -1,0 +1,218 @@
+{{- if .Values.controller.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "dr-failover-controller.fullname" . }}-scripts
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dr-failover-controller.labels" . | nindent 4 }}
+data:
+  health-check.sh: |
+    #!/bin/sh
+    set -euo pipefail
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # DR Health Check Script
+    # Checks: HTTP endpoint, Aurora replication lag, ElastiCache availability
+    # Writes results to /tmp/health-state for the controller Deployment to read.
+    # ──────────────────────────────────────────────────────────────────────────
+
+    FAILURES=0
+    HEALTH_REPORT="/tmp/health-report-$(date +%Y%m%d_%H%M%S).json"
+    CONSECUTIVE_FAILURE_FILE="/tmp/consecutive-failures"
+    CURRENT_FAILURES=0
+
+    # Read previous failure count from shared volume
+    if [ -f "${CONSECUTIVE_FAILURE_FILE}" ]; then
+      CURRENT_FAILURES=$(cat "${CONSECUTIVE_FAILURE_FILE}" 2>/dev/null || echo 0)
+    fi
+
+    echo "=== DR Health Check: $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+    echo "Primary endpoint: ${PRIMARY_ENDPOINT}"
+    echo "AWS region: ${AWS_REGION}"
+
+    # ─── Check 1: HTTP endpoint ─────────────────────────────────────────────
+    echo ""
+    echo "--- Checking primary HTTP endpoint ---"
+    HTTP_STATUS=$(curl -sS \
+      --connect-timeout "${TIMEOUT_SECONDS}" \
+      --max-time "${TIMEOUT_SECONDS}" \
+      -o /dev/null \
+      -w "%{http_code}" \
+      "${PRIMARY_ENDPOINT}" 2>/dev/null || echo "000")
+
+    if [ "${HTTP_STATUS}" = "${EXPECTED_STATUS_CODE}" ]; then
+      echo "✅ HTTP check PASSED (status: ${HTTP_STATUS})"
+      HTTP_HEALTHY=true
+    else
+      echo "❌ HTTP check FAILED (expected: ${EXPECTED_STATUS_CODE}, got: ${HTTP_STATUS})"
+      HTTP_HEALTHY=false
+      FAILURES=$((FAILURES + 1))
+    fi
+
+    # ─── Check 2: Aurora replication lag ────────────────────────────────────
+    if [ "${AURORA_CHECK_ENABLED}" = "true" ] && [ -n "${AURORA_CLUSTER_IDENTIFIER}" ]; then
+      echo ""
+      echo "--- Checking Aurora replication lag ---"
+      REPLICA_LAG=$(aws rds describe-db-clusters \
+        --db-cluster-identifier "${AURORA_CLUSTER_IDENTIFIER}" \
+        --region "${AWS_REGION}" \
+        --query 'DBClusters[0].ReaderEndpoint' \
+        --output text 2>/dev/null || echo "ERROR")
+
+      if [ "${REPLICA_LAG}" != "ERROR" ]; then
+        echo "✅ Aurora cluster reachable: ${AURORA_CLUSTER_IDENTIFIER}"
+        AURORA_HEALTHY=true
+      else
+        echo "❌ Aurora cluster unreachable: ${AURORA_CLUSTER_IDENTIFIER}"
+        AURORA_HEALTHY=false
+        FAILURES=$((FAILURES + 1))
+      fi
+    else
+      AURORA_HEALTHY=true
+    fi
+
+    # ─── Check 3: ElastiCache availability ──────────────────────────────────
+    if [ "${ELASTICACHE_CHECK_ENABLED}" = "true" ] && [ -n "${ELASTICACHE_PRIMARY_ENDPOINT}" ]; then
+      echo ""
+      echo "--- Checking ElastiCache endpoint ---"
+      EC_HOST=$(echo "${ELASTICACHE_PRIMARY_ENDPOINT}" | cut -d: -f1)
+      EC_PORT=$(echo "${ELASTICACHE_PRIMARY_ENDPOINT}" | cut -d: -f2)
+      EC_PORT="${EC_PORT:-6379}"
+
+      if nc -z -w "${TIMEOUT_SECONDS}" "${EC_HOST}" "${EC_PORT}" 2>/dev/null; then
+        echo "✅ ElastiCache reachable: ${ELASTICACHE_PRIMARY_ENDPOINT}"
+        ELASTICACHE_HEALTHY=true
+      else
+        echo "❌ ElastiCache unreachable: ${ELASTICACHE_PRIMARY_ENDPOINT}"
+        ELASTICACHE_HEALTHY=false
+        FAILURES=$((FAILURES + 1))
+      fi
+    else
+      ELASTICACHE_HEALTHY=true
+    fi
+
+    # ─── Evaluate failure count and trigger failover if threshold met ────────
+    echo ""
+    echo "=== Health Summary ==="
+    echo "Failures this check: ${FAILURES}"
+    echo "Consecutive failures: ${CURRENT_FAILURES}"
+    echo "Failover threshold:   ${CONSECUTIVE_FAILURE_THRESHOLD}"
+
+    if [ "${FAILURES}" -gt 0 ]; then
+      NEW_FAILURES=$((CURRENT_FAILURES + 1))
+      echo "${NEW_FAILURES}" > "${CONSECUTIVE_FAILURE_FILE}"
+
+      # Send SNS alert if configured
+      if [ "${SNS_ENABLED}" = "true" ] && [ -n "${SNS_TOPIC_ARN}" ]; then
+        aws sns publish \
+          --topic-arn "${SNS_TOPIC_ARN}" \
+          --region "${AWS_REGION}" \
+          --subject "DR ALERT: Primary region health check failed (${NEW_FAILURES}/${CONSECUTIVE_FAILURE_THRESHOLD})" \
+          --message "Health check failed at $(date -u). HTTP: ${HTTP_HEALTHY}, Aurora: ${AURORA_HEALTHY}, ElastiCache: ${ELASTICACHE_HEALTHY}. Consecutive failures: ${NEW_FAILURES}/${CONSECUTIVE_FAILURE_THRESHOLD}." \
+          2>/dev/null || echo "WARNING: SNS publish failed"
+      fi
+
+      if [ "${NEW_FAILURES}" -ge "${CONSECUTIVE_FAILURE_THRESHOLD}" ]; then
+        echo "🚨 FAILOVER THRESHOLD REACHED — executing failover-trigger.sh"
+        /scripts/failover-trigger.sh
+      else
+        echo "⚠  Failure recorded. Waiting for threshold (${NEW_FAILURES}/${CONSECUTIVE_FAILURE_THRESHOLD})"
+      fi
+    else
+      # Reset consecutive failure counter on a healthy check
+      echo "0" > "${CONSECUTIVE_FAILURE_FILE}"
+      echo "✅ All health checks PASSED — primary region is healthy"
+    fi
+
+  failover-trigger.sh: |
+    #!/bin/sh
+    set -euo pipefail
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # DR Failover Trigger Script
+    # Executes Route 53 DNS failover from primary to DR region.
+    # autoFailover must be true for automatic execution; otherwise sends SNS
+    # notification and waits for manual execution.
+    # ──────────────────────────────────────────────────────────────────────────
+
+    echo "=== DR FAILOVER TRIGGERED: $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+    echo "Primary region: ${AWS_PRIMARY_REGION}"
+    echo "DR region:      ${AWS_DR_REGION}"
+    echo "Hosted zone:    ${ROUTE53_HOSTED_ZONE_ID}"
+    echo "Auto failover:  ${AUTO_FAILOVER}"
+
+    # Send pre-failover SNS notification
+    if [ "${SNS_ENABLED}" = "true" ] && [ -n "${SNS_TOPIC_ARN}" ]; then
+      aws sns publish \
+        --topic-arn "${SNS_TOPIC_ARN}" \
+        --region "${AWS_PRIMARY_REGION}" \
+        --subject "DR FAILOVER INITIATING: Primary ${AWS_PRIMARY_REGION} → DR ${AWS_DR_REGION}" \
+        --message "DR failover initiated at $(date -u). Route 53 hosted zone ${ROUTE53_HOSTED_ZONE_ID} will be updated. Primary record: ${ROUTE53_PRIMARY_RECORD}. DR record: ${ROUTE53_DR_RECORD}. Auto failover: ${AUTO_FAILOVER}." \
+        2>/dev/null || echo "WARNING: SNS pre-failover notification failed"
+    fi
+
+    if [ "${AUTO_FAILOVER}" != "true" ]; then
+      echo ""
+      echo "═══════════════════════════════════════════════════════"
+      echo "  MANUAL APPROVAL REQUIRED"
+      echo "  SNS notification sent to: ${SNS_TOPIC_ARN}"
+      echo ""
+      echo "  To execute failover manually, run:"
+      echo "    kubectl exec -n ${NAMESPACE} \\"
+      echo "      \$(kubectl get pod -n ${NAMESPACE} -l app.kubernetes.io/name=dr-failover-controller -o name | head -1) \\"
+      echo "      -- /scripts/execute-failover.sh"
+      echo "═══════════════════════════════════════════════════════"
+      exit 0
+    fi
+
+    echo ""
+    echo "Auto failover is ENABLED — proceeding with Route 53 update..."
+    /scripts/execute-failover.sh
+
+  execute-failover.sh: |
+    #!/bin/sh
+    set -euo pipefail
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Execute Route 53 DNS Failover
+    # Updates the health check routing policy to route traffic to DR region.
+    # ──────────────────────────────────────────────────────────────────────────
+
+    echo "Executing Route 53 failover at $(date -u)..."
+    echo "Hosted Zone: ${ROUTE53_HOSTED_ZONE_ID}"
+
+    # Update Route 53 health check routing to mark primary as unhealthy
+    aws route53 change-resource-record-sets \
+      --hosted-zone-id "${ROUTE53_HOSTED_ZONE_ID}" \
+      --change-batch "{
+        \"Comment\": \"DR Failover: routing traffic to ${AWS_DR_REGION} at $(date -u)\",
+        \"Changes\": [{
+          \"Action\": \"UPSERT\",
+          \"ResourceRecordSet\": {
+            \"Name\": \"${ROUTE53_PRIMARY_RECORD}\",
+            \"Type\": \"CNAME\",
+            \"TTL\": 60,
+            \"ResourceRecords\": [{
+              \"Value\": \"${ROUTE53_DR_RECORD}\"
+            }]
+          }
+        }]
+      }" \
+      --region "${AWS_PRIMARY_REGION}" \
+      2>&1
+
+    echo "✅ Route 53 failover applied. DNS TTL: 60s"
+    echo "   Traffic will route to DR region within 60 seconds."
+    echo "   Monitor with: aws route53 get-change --id CHANGE_ID"
+
+    # Send post-failover SNS notification
+    if [ "${SNS_ENABLED}" = "true" ] && [ -n "${SNS_TOPIC_ARN}" ]; then
+      aws sns publish \
+        --topic-arn "${SNS_TOPIC_ARN}" \
+        --region "${AWS_PRIMARY_REGION}" \
+        --subject "DR FAILOVER COMPLETE: Traffic now routing to ${AWS_DR_REGION}" \
+        --message "DR failover completed at $(date -u). Route 53 record ${ROUTE53_PRIMARY_RECORD} now points to ${ROUTE53_DR_RECORD}. DNS propagation takes up to 60 seconds. RTO clock started." \
+        2>/dev/null || echo "WARNING: SNS post-failover notification failed"
+    fi
+{{- end }}

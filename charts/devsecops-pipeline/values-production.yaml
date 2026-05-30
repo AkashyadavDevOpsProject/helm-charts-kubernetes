@@ -1,0 +1,199 @@
+# ==============================================================================
+# devsecops-pipeline — Production values for GitLab Runner fleet on EKS
+# Region: ap-south-1 (Mumbai) | GitLab: self-hosted
+#
+# Deploy:
+#   helm upgrade --install devsecops akashyadav/devsecops-pipeline \
+#     --namespace devops \
+#     --create-namespace \
+#     -f charts/devsecops-pipeline/values-production.yaml \
+#     --set gitlab.runner.gitlabUrl=$GITLAB_URL \
+#     --set gitlab.runner.runnerToken=$GITLAB_RUNNER_TOKEN \
+#     --set vault.agent.address=$VAULT_ADDR \
+#     --set vault.agent.role=$VAULT_ROLE \
+#     --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=$RUNNER_IRSA_ROLE_ARN \
+#     --atomic --timeout 10m
+# ==============================================================================
+
+gitlab:
+  runner:
+    enabled: true
+
+    # replicas: 5 runner managers handle 50 concurrent jobs (5 × 10).
+    # Sized for peak CI/CD activity: end-of-sprint merges across 8 squads.
+    # Default was 3 — insufficient during sprint finishes causing pipeline queuing.
+    replicas: 5
+
+    # gitlabUrl: self-hosted GitLab instance — set via CI/CD variable, not hardcoded.
+    gitlabUrl: ""  # Set via --set or GitLab CI/CD variable ($GITLAB_URL)
+
+    # runnerToken: set via CI/CD secret — never committed to Git.
+    runnerToken: ""  # Set via --set or GitLab CI/CD variable ($GITLAB_RUNNER_TOKEN)
+
+    existingSecret: ""
+
+    # concurrent: 10 jobs per manager pod = 50 total with 5 replicas.
+    # Set based on cluster capacity — each job pod needs ~500m CPU / 512Mi RAM.
+    concurrent: 10
+
+    # checkInterval: 3s default — keeps job pickup latency low.
+    # Increasing this would make pipelines feel sluggish to developers.
+    checkInterval: 3
+
+    image:
+      registry: registry.gitlab.com
+      image: gitlab-org/gitlab-runner
+      # alpine-v16.9.0: pinned for reproducibility.
+      # Upgrading runners requires CI testing to catch API compatibility changes.
+      tag: alpine-v16.9.0
+      pullPolicy: IfNotPresent
+
+    resources:
+      requests:
+        # 200m / 256Mi: runner manager is mostly idle — just dispatching jobs.
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        # 2000m / 2Gi: allow burst during simultaneous job scheduling spikes.
+        cpu: 2000m
+        memory: 2Gi
+
+    sessionServer:
+      enabled: false
+
+    config: |
+      concurrent = 10
+      check_interval = 3
+      shutdown_timeout = 30
+
+      [session_server]
+        session_timeout = 1800
+
+      [[runners]]
+        url = ""
+        executor = "kubernetes"
+        environment = ["FF_USE_ADVANCED_POD_SPEC_CONFIGURATION=true"]
+
+        [runners.kubernetes]
+          namespace = "devops"
+          image = "alpine:3.19"
+          pull_policy = "always"
+          service_account = ""
+          privileged = false
+          allow_privilege_escalation = false
+
+          # Job pod resources: generous limits for build/test jobs.
+          # Under-resourcing job pods causes flaky tests and slow builds.
+          cpu_request = "500m"
+          cpu_limit = "4000m"
+          memory_request = "512Mi"
+          memory_limit = "4Gi"
+
+          [runners.kubernetes.pod_labels]
+            "app" = "gitlab-runner-job"
+            "managed-by" = "gitlab-runner"
+
+          [runners.kubernetes.pod_security_context]
+            run_as_non_root = true
+            run_as_user = 1000
+
+          [[runners.kubernetes.volumes.empty_dir]]
+            name = "tmp"
+            mount_path = "/tmp"
+            medium = "Memory"
+
+          [[runners.kubernetes.volumes.empty_dir]]
+            name = "home"
+            mount_path = "/home/gitlab-runner"
+
+trivy:
+  enabled: true
+  image:
+    repository: aquasec/trivy
+    # 0.49.0: pinned version — Trivy DB schema changes between minor versions.
+    # Update tested in staging before rolling to production runners.
+    tag: "0.49.0"
+    pullPolicy: IfNotPresent
+
+  # HIGH,CRITICAL only: LOW/MEDIUM findings are reported but don't block deployments.
+  # This prevents the pipeline from being permanently blocked by OS package CVEs
+  # that have no available fix (common in base images).
+  severity: "HIGH,CRITICAL"
+  exitCode: 1
+  # ignoreUnfixed: true — don't fail on CVEs the image vendor hasn't patched yet.
+  # Required for compliance: we track these in the security backlog, not block CI.
+  ignoreUnfixed: true
+  # 10m timeout: production images are large (JVM services ~1.5GB) — 5m default
+  # causes false-positive scan failures on the first pull after a cold cache.
+  timeout: "10m"
+  cacheDir: "/tmp/trivy"
+
+vault:
+  agent:
+    # enabled: true — Vault agent injects secrets into runner pods so CI jobs
+    # can access deployment credentials without storing them in GitLab variables.
+    # This is the SOC 2-approved secret delivery mechanism.
+    enabled: true
+
+    # address: self-hosted Vault cluster in ap-south-1 — set via CI/CD variable.
+    address: ""  # Set via --set or GitLab CI/CD variable ($VAULT_ADDR)
+
+    # role: Vault Kubernetes auth role for the runner ServiceAccount.
+    role: ""  # Set via --set or GitLab CI/CD variable ($VAULT_ROLE)
+
+    authPath: kubernetes
+    namespace: ""
+
+    image:
+      repository: hashicorp/vault
+      # 1.15.0: pinned for stability. Vault API is stable but agent injection
+      # behaviour changed in 1.14 — tested upgrade path before bumping.
+      tag: "1.15.0"
+      pullPolicy: IfNotPresent
+
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+opa:
+  enabled: true
+  policies:
+    requireNonRootUser: true
+    requireReadOnlyRootFS: true
+    # blockLatestTag: critical for production deployments.
+    # A :latest tag makes rollbacks non-deterministic — this is a hard block.
+    blockLatestTag: true
+    requireResourceLimits: true
+    # requireTrustedRegistry: true in production — only ECR images allowed.
+    # Prevents supply-chain attacks via public Docker Hub images in production pipelines.
+    requireTrustedRegistry: true
+    # trustedRegistries: only our ECR registry is permitted in production.
+    # registry.gitlab.com is allowed for the runner image itself.
+    trustedRegistries:
+      - ""  # Set to your ECR registry prefix e.g. 123456789.dkr.ecr.ap-south-1.amazonaws.com
+
+serviceAccount:
+  create: true
+  # IRSA role grants the runner: ECR pull, S3 read for build cache, STS assume-role
+  # for deployment to production cluster.
+  annotations: {}  # Set via --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=ARN
+  name: ""
+
+rbac:
+  create: true
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL

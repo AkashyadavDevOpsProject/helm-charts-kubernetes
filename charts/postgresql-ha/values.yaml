@@ -1,0 +1,247 @@
+# ------------------------------------------------------------------------------
+# postgresql-ha Helm chart values
+# Architecture: Apps → PgBouncer → PostgreSQL Primary → Replicas
+# Sensitive values (passwords) must be set via --set or existingSecret.
+# Never commit passwords to source control.
+# ------------------------------------------------------------------------------
+
+# nameOverride: Overrides the chart name portion of generated resource names.
+nameOverride: ""
+# fullnameOverride: Completely overrides the generated resource name.
+fullnameOverride: ""
+
+# ──────────────────────────────────────────────
+# PostgreSQL configuration
+# ──────────────────────────────────────────────
+postgresql:
+  # enabled: Set false to skip the PostgreSQL StatefulSet (e.g. use external DB).
+  enabled: true
+
+  # replicaCount: Total pods = 1 primary + (replicaCount - 1) replicas.
+  # Minimum 2 for HA. 3 gives quorum for repmgr failover decisions.
+  replicaCount: 3
+
+  image:
+    # repository: bitnami/postgresql-repmgr bundles PostgreSQL with repmgr for HA.
+    repository: bitnami/postgresql-repmgr
+    # tag: PostgreSQL 16 LTS — the current stable release as of 2024.
+    tag: "16.2.0"
+    pullPolicy: IfNotPresent
+
+  auth:
+    # postgresPassword: REQUIRED. PostgreSQL superuser (postgres) password.
+    # Set via: --set postgresql.auth.postgresPassword=yourpassword
+    postgresPassword: ""
+
+    # username: Application database username (non-superuser).
+    username: ""
+
+    # password: Application database user password.
+    # Set via: --set postgresql.auth.password=yourpassword
+    password: ""
+
+    # database: Application database name to create on first start.
+    database: ""
+
+    # existingSecret: Name of an existing Kubernetes Secret with DB credentials.
+    # When set, the password fields above are ignored.
+    # Secret must have keys matching secretKeys below.
+    existingSecret: ""
+
+    secretKeys:
+      # adminPasswordKey: Key in the secret for the postgres superuser password.
+      adminPasswordKey: postgres-password
+      # userPasswordKey: Key in the secret for the application user password.
+      userPasswordKey: password
+      # replicationPasswordKey: Key for the replication user password.
+      replicationPasswordKey: replication-password
+
+  primary:
+    resources:
+      requests:
+        # cpu: PostgreSQL is CPU-intensive under load. Start with 500m and tune.
+        cpu: 500m
+        # memory: Shared buffers are typically 25% of total RAM. Match accordingly.
+        memory: 512Mi
+      limits:
+        cpu: 2000m
+        memory: 2Gi
+
+    persistence:
+      enabled: true
+      # storageClass: gp3 provides better IOPS than gp2 at lower cost.
+      storageClass: gp3
+      # size: Provision 3x your expected data volume to accommodate WAL + indexes.
+      size: 50Gi
+      accessModes:
+        - ReadWriteOnce
+
+    # postgresql.conf overrides — appended to the default config.
+    extendedConfiguration: |
+      max_connections = 200
+      shared_buffers = 256MB
+      effective_cache_size = 768MB
+      maintenance_work_mem = 64MB
+      checkpoint_completion_target = 0.9
+      wal_buffers = 16MB
+      default_statistics_target = 100
+      random_page_cost = 1.1
+      effective_io_concurrency = 200
+      min_wal_size = 1GB
+      max_wal_size = 4GB
+      log_min_duration_statement = 1000
+      log_checkpoints = on
+      log_connections = on
+      log_disconnections = on
+      log_lock_waits = on
+
+  replica:
+    resources:
+      requests:
+        cpu: 250m
+        memory: 256Mi
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+
+    persistence:
+      enabled: true
+      storageClass: gp3
+      # size: Replicas must have the same or larger PVC as the primary.
+      size: 50Gi
+      accessModes:
+        - ReadWriteOnce
+
+  metrics:
+    # enabled: Deploy postgres_exporter sidecar for Prometheus scraping.
+    enabled: true
+    image:
+      repository: bitnami/postgres-exporter
+      tag: "0.15.0"
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+    serviceMonitor:
+      # enabled: Create a ServiceMonitor CRD for Prometheus Operator scraping.
+      enabled: true
+      # interval: How often Prometheus scrapes PostgreSQL metrics.
+      interval: 30s
+
+# ──────────────────────────────────────────────
+# PgBouncer — connection pooler
+# ──────────────────────────────────────────────
+pgbouncer:
+  # enabled: Always enable in production to pool connections and reduce
+  # PostgreSQL connection overhead. max_connections in PG is precious.
+  enabled: true
+
+  # replicaCount: 2 for HA. Applications connect to PgBouncer, not PostgreSQL directly.
+  replicaCount: 2
+
+  # poolMode: transaction mode is correct for most web/API applications.
+  # session mode required for applications using advisory locks or prepared statements.
+  poolMode: transaction
+
+  # maxClientConn: Maximum connections from application pods to PgBouncer.
+  # Set based on peak concurrency of all application pods combined.
+  maxClientConn: 1000
+
+  # defaultPoolSize: Connections from PgBouncer to PostgreSQL primary.
+  # Keep low (20-50) — PostgreSQL does not handle high connection counts well.
+  defaultPoolSize: 25
+
+  # minPoolSize: Minimum idle connections to maintain for low-latency response.
+  minPoolSize: 5
+
+  # reservePoolSize: Extra connections for bursts above defaultPoolSize.
+  reservePoolSize: 5
+
+  image:
+    repository: bitnami/pgbouncer
+    # tag: PgBouncer 1.22 — supports TLS and modern auth methods.
+    tag: "1.22.1"
+    pullPolicy: IfNotPresent
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      # cpu: PgBouncer is single-threaded but low CPU — 500m is generous.
+      cpu: 500m
+      memory: 512Mi
+
+# ──────────────────────────────────────────────
+# S3 backup CronJob
+# ──────────────────────────────────────────────
+backup:
+  # enabled: Set true to deploy the pg_dump to S3 CronJob.
+  # Requires IRSA role with s3:PutObject on the target bucket.
+  enabled: true
+
+  # schedule: Cron expression for backup frequency. Default: daily at 02:00 UTC.
+  # Use off-peak hours in your primary region timezone.
+  schedule: "0 2 * * *"
+
+  # s3Bucket: REQUIRED if enabled. S3 bucket name for backup storage.
+  # Do NOT include s3:// prefix or trailing slash.
+  s3Bucket: ""
+
+  # s3Region: REQUIRED if enabled. AWS region where the S3 bucket resides.
+  s3Region: ""
+
+  # s3Prefix: S3 key prefix (folder) for backup files.
+  s3Prefix: "postgresql-backups"
+
+  # retentionDays: Lifecycle rule applied to backup objects.
+  # Backups older than this many days are automatically deleted.
+  retentionDays: 30
+
+  # successfulJobsHistoryLimit: Number of completed backup jobs to retain.
+  successfulJobsHistoryLimit: 3
+
+  # failedJobsHistoryLimit: Number of failed backup jobs to retain for diagnosis.
+  failedJobsHistoryLimit: 3
+
+  image:
+    # repository: Official PostgreSQL image for pg_dump + AWS CLI for S3 upload.
+    repository: postgres
+    tag: "16.2"
+    pullPolicy: IfNotPresent
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      # cpu: pg_dump is CPU and I/O intensive — allow burst during backup window.
+      cpu: 500m
+      memory: 512Mi
+
+# ──────────────────────────────────────────────
+# NetworkPolicy
+# ──────────────────────────────────────────────
+networkPolicy:
+  # enabled: Restrict which namespaces can connect to PostgreSQL and PgBouncer.
+  # All namespaces are blocked by default except those listed in allowNamespaces.
+  enabled: true
+
+  # allowNamespaces: List of namespace label selectors allowed to connect.
+  # Example: [{name: backend}, {name: api-hub}]
+  # Each entry is matched against the 'name' label on the namespace.
+  allowNamespaces: []
+
+# ──────────────────────────────────────────────
+# ServiceAccount (for IRSA — S3 backup access)
+# ──────────────────────────────────────────────
+serviceAccount:
+  # create: Create a ServiceAccount for backup job pods.
+  create: true
+  # annotations: Add IRSA annotation to grant S3 access without static credentials.
+  # Example: eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT:role/pg-backup-role
+  annotations: {}
+  name: ""

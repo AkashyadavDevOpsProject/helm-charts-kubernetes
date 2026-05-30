@@ -1,0 +1,64 @@
+Thank you for installing {{ .Chart.Name }} v{{ .Chart.Version }}
+
+Release:   {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Applications  →  PgBouncer  →  PostgreSQL Primary
+                                     └──→  Replica(s)
+
+  Topology:
+    Primary:  {{ include "postgresql-ha.fullname" . }}-primary-0   (writes)
+    Replicas: {{ include "postgresql-ha.fullname" . }}-replica-*   (reads)
+    PgBouncer: {{ include "postgresql-ha.fullname" . }}-pgbouncer   (connection pooling)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  CONNECTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ⚡ Connect via PgBouncer (recommended for all apps):
+     Host:     {{ include "postgresql-ha.fullname" . }}-pgbouncer.{{ .Release.Namespace }}.svc.cluster.local
+     Port:     5432
+     Database: {{ .Values.postgresql.auth.database | default "postgres" }}
+     User:     {{ .Values.postgresql.auth.username | default "postgres" }}
+
+  Direct primary (migrations, admin tasks only):
+     Host:     {{ include "postgresql-ha.fullname" . }}-primary.{{ .Release.Namespace }}.svc.cluster.local
+
+  Direct replica (read-only queries only):
+     Host:     {{ include "postgresql-ha.fullname" . }}-replica.{{ .Release.Namespace }}.svc.cluster.local
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  VERIFY REPLICATION STATUS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  kubectl exec -n {{ .Release.Namespace }} \
+    {{ include "postgresql-ha.fullname" . }}-primary-0 \
+    -- psql -U postgres -c "SELECT * FROM pg_stat_replication;"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  BACKUP STATUS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Scheduled backup: {{ if .Values.backup.enabled }}✅ ENABLED ({{ .Values.backup.schedule }})
+  S3 target: s3://{{ .Values.backup.s3Bucket }}/{{ .Values.backup.s3Prefix }}
+  Retention: {{ .Values.backup.retentionDays }} days
+
+  Check backup history:
+    kubectl get jobs -n {{ .Release.Namespace }} -l app.kubernetes.io/component=backup
+
+  Trigger a manual backup:
+    kubectl create job --from=cronjob/{{ include "postgresql-ha.fullname" . }}-backup \
+      manual-backup-$(date +%Y%m%d) -n {{ .Release.Namespace }}
+{{- else }}❌ DISABLED — data is NOT being backed up{{- end }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  IMPORTANT WARNINGS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ⚠  PVC data persists after helm uninstall. Delete PVCs manually:
+     kubectl delete pvc -n {{ .Release.Namespace }} -l app.kubernetes.io/instance={{ .Release.Name }}
+
+  ⚠  Credentials secret has helm.sh/resource-policy: keep
+     Delete manually if you want to reprovision with new credentials.
+
+  ⚠  Do NOT route application writes to replicas — they are read-only.
+     All writes MUST go through PgBouncer → primary.

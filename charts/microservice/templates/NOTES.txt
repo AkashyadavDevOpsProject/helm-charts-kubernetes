@@ -1,0 +1,62 @@
+Thank you for installing {{ .Chart.Name }} v{{ .Chart.Version }}
+
+Release:   {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ACCESS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{{- if .Values.ingress.enabled }}
+Your service is accessible at:
+{{- range .Values.ingress.hosts }}
+  https://{{ .host }}
+{{- end }}
+{{- else }}
+Access your service locally with:
+  kubectl port-forward svc/{{ include "microservice.fullname" . }} \
+    8080:{{ .Values.service.port }} -n {{ .Release.Namespace }}
+
+Then open: http://localhost:8080
+{{- end }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  CONFIGURATION SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Image:        {{ .Values.image.repository }}:{{ .Values.image.tag }}
+Replicas:     {{ .Values.replicaCount }}
+
+Autoscaling:  {{- if .Values.autoscaling.enabled }} ENABLED ({{ .Values.autoscaling.minReplicas }}–{{ .Values.autoscaling.maxReplicas }} replicas, CPU {{ .Values.autoscaling.targetCPUUtilizationPercentage }}%)
+{{- else }} DISABLED{{- end }}
+
+PodDisruptionBudget: {{- if .Values.podDisruptionBudget.enabled }} ENABLED (minAvailable: {{ .Values.podDisruptionBudget.minAvailable }})
+{{- else }} DISABLED{{- end }}
+
+NetworkPolicy: {{- if .Values.networkPolicy.enabled }} ENABLED — only allowed namespaces can reach this service
+{{- else }} DISABLED — WARNING: all pods in the cluster can reach this service{{- end }}
+
+Secrets Store CSI: {{- if .Values.secretsStoreCsi.enabled }} ENABLED (SecretProviderClass: {{ .Values.secretsStoreCsi.secretProviderClass }})
+{{- else }} DISABLED{{- end }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  NEXT STEPS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. Verify pods are running:
+   kubectl get pods -n {{ .Release.Namespace }} \
+     -l app.kubernetes.io/name={{ include "microservice.name" . }}
+
+2. Check HPA status:
+   kubectl get hpa -n {{ .Release.Namespace }} {{ include "microservice.fullname" . }}
+
+3. Tail application logs:
+   kubectl logs -n {{ .Release.Namespace }} \
+     -l app.kubernetes.io/name={{ include "microservice.name" . }} -f
+
+4. Check events if pods are not starting:
+   kubectl describe pod -n {{ .Release.Namespace }} \
+     -l app.kubernetes.io/name={{ include "microservice.name" . }}
+
+{{- if not .Values.serviceAccount.annotations }}
+⚠  WARNING: No IRSA annotation on the ServiceAccount.
+   If this service needs AWS API access, add:
+   --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::ACCOUNT:role/ROLE
+{{- end }}

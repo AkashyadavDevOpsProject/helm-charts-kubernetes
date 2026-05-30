@@ -1,0 +1,223 @@
+# ==============================================================================
+# postgresql-ha — Production values for FinTech payment database on EKS
+# Region: ap-south-1 (Mumbai) | PostgreSQL 16 | 1 primary + 2 replicas
+#
+# Deploy:
+#   helm upgrade --install postgres akashyadav/postgresql-ha \
+#     --namespace data \
+#     --create-namespace \
+#     -f charts/postgresql-ha/values-production.yaml \
+#     --set postgresql.auth.postgresPassword=$PG_SUPERUSER_PASSWORD \
+#     --set postgresql.auth.password=$PG_APP_PASSWORD \
+#     --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=$PG_BACKUP_IRSA_ARN \
+#     --atomic --timeout 20m
+#
+# Pre-requisites:
+#   - gp3 StorageClass available: kubectl get sc gp3
+#   - IRSA role with s3:PutObject on the backup bucket
+#   - NetworkPolicy: namespaces that need DB access must have label 'name: backend' etc.
+# ==============================================================================
+
+postgresql:
+  enabled: true
+
+  # replicaCount: 3 = 1 primary + 2 replicas.
+  # 2 replicas: one handles read traffic, one is standby for failover.
+  # Minimum for production HA — repmgr needs 2 standbys for quorum-based promotion.
+  replicaCount: 3
+
+  image:
+    repository: bitnami/postgresql-repmgr
+    # 16.2.0: PostgreSQL 16 LTS. Major version upgrades require planned downtime
+    # and are coordinated with the application team for schema compatibility testing.
+    tag: "16.2.0"
+    pullPolicy: IfNotPresent
+
+  auth:
+    # postgresPassword: set via --set from CI/CD secret. Rotated quarterly.
+    postgresPassword: ""  # Set via --set or GitLab CI/CD variable ($PG_SUPERUSER_PASSWORD)
+    # username: non-superuser app account — principle of least privilege.
+    username: appuser
+    # password: set via --set — never in values files.
+    password: ""  # Set via --set or GitLab CI/CD variable ($PG_APP_PASSWORD)
+    # database: primary application database.
+    database: cashinvoice_prod
+    existingSecret: ""
+    secretKeys:
+      adminPasswordKey: postgres-password
+      userPasswordKey: password
+      replicationPasswordKey: replication-password
+
+  primary:
+    resources:
+      requests:
+        # 2000m / 4Gi: primary handles all writes plus read traffic from PgBouncer.
+        # Sized from pg_stat_statements analysis: p95 query concurrency = 45 queries/s.
+        # Default 500m/512Mi was causing CPU throttling during payment batch jobs.
+        cpu: 2000m
+        memory: 4Gi
+      limits:
+        # 8000m / 8Gi: allow burst for batch operations without killing the pod.
+        cpu: 8000m
+        memory: 8Gi
+
+    persistence:
+      enabled: true
+      storageClass: gp3
+      # 200Gi: current data volume is 45GB. 200Gi gives 4x headroom for 18 months.
+      # EBS volumes can be expanded online but require a pod restart — plan ahead.
+      size: 200Gi
+      accessModes:
+        - ReadWriteOnce
+
+    # extendedConfiguration: tuned for payment workload on 8GB RAM node.
+    # Values derived from pgtune.leopard.in/config for 8GB OLTP workload.
+    extendedConfiguration: |
+      max_connections = 150
+      shared_buffers = 2GB
+      effective_cache_size = 6GB
+      maintenance_work_mem = 512MB
+      checkpoint_completion_target = 0.9
+      wal_buffers = 64MB
+      default_statistics_target = 200
+      random_page_cost = 1.1
+      effective_io_concurrency = 200
+      min_wal_size = 2GB
+      max_wal_size = 8GB
+      max_worker_processes = 8
+      max_parallel_workers_per_gather = 4
+      max_parallel_workers = 8
+      max_parallel_maintenance_workers = 4
+      log_min_duration_statement = 500
+      log_checkpoints = on
+      log_connections = on
+      log_disconnections = on
+      log_lock_waits = on
+      deadlock_timeout = 1s
+      idle_in_transaction_session_timeout = 30000
+      statement_timeout = 300000
+
+  replica:
+    resources:
+      requests:
+        # 1000m / 2Gi: replicas handle read-only queries — lighter than primary.
+        cpu: 1000m
+        memory: 2Gi
+      limits:
+        cpu: 4000m
+        memory: 4Gi
+
+    persistence:
+      enabled: true
+      storageClass: gp3
+      # 200Gi: must be equal to or greater than primary PVC.
+      # Smaller replica PVCs cause repmgr clone failures.
+      size: 200Gi
+      accessModes:
+        - ReadWriteOnce
+
+  metrics:
+    enabled: true
+    image:
+      repository: bitnami/postgres-exporter
+      tag: "0.15.0"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+    serviceMonitor:
+      # enabled: Prometheus scrapes postgres_exporter every 30s.
+      # Alerts on replication lag (> 30s) are configured in observability-stack.
+      enabled: true
+      interval: 30s
+
+pgbouncer:
+  enabled: true
+
+  # replicaCount: 2 PgBouncer pods — HA without adding significant resource cost.
+  # If one pod is evicted during a node drain, the other handles all traffic.
+  replicaCount: 2
+
+  # transaction: correct for Spring Boot / Node.js apps using connection pools.
+  # session mode required only if using advisory locks or SET LOCAL — not in our stack.
+  poolMode: transaction
+
+  # maxClientConn: 500 — sized for 30 application pods × 15 connections each + 50 buffer.
+  # Default 1000 is generous for our workload; 500 is sufficient and protects the DB.
+  maxClientConn: 500
+
+  # defaultPoolSize: 40 connections from PgBouncer to PostgreSQL.
+  # Primary's max_connections is 150: 40 PgBouncer + 5 repmgr + 5 admin = 50, safe.
+  defaultPoolSize: 40
+  minPoolSize: 10
+  reservePoolSize: 10
+
+  image:
+    repository: bitnami/pgbouncer
+    tag: "1.22.1"
+    pullPolicy: IfNotPresent
+
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      # 1000m: PgBouncer is single-threaded but spikes during connection storms.
+      cpu: 1000m
+      memory: 512Mi
+
+backup:
+  enabled: true
+
+  # 01:30 UTC = 07:00 IST — lowest traffic window for payment platform.
+  # Default 02:00 UTC chosen to avoid overlapping with any scheduled batch jobs.
+  schedule: "30 1 * * *"
+
+  # s3Bucket: target bucket for pg_dump backups — set in environment config.
+  s3Bucket: ""  # Set via --set or GitLab CI/CD variable ($PG_BACKUP_S3_BUCKET)
+
+  # s3Region: ap-south-1 — backup bucket is in the same region as the cluster.
+  # Cross-region replication of backups is handled by S3 replication rules in Terraform.
+  s3Region: ap-south-1
+
+  s3Prefix: "postgresql/prod"
+
+  # retentionDays: 90 days — exceeds the 30-day SOC 2 requirement.
+  # Extended to support quarterly audit requests for point-in-time data.
+  retentionDays: 90
+
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 5
+
+  image:
+    repository: postgres
+    tag: "16.2"
+    pullPolicy: IfNotPresent
+
+  resources:
+    requests:
+      cpu: 500m
+      # 512Mi: pg_dump buffers the dump in memory before compression.
+      # Undersizing causes OOM during large table dumps.
+      memory: 512Mi
+    limits:
+      cpu: 2000m
+      memory: 2Gi
+
+networkPolicy:
+  enabled: true
+  # allowNamespaces: only the application namespaces that actually need DB access.
+  # Adding a namespace here requires a security review — not self-service.
+  allowNamespaces:
+    - name: production
+    - name: staging
+
+serviceAccount:
+  create: true
+  # IRSA role: grants s3:PutObject + s3:GetObject + s3:ListBucket on the backup bucket.
+  # No other AWS permissions — principle of least privilege.
+  annotations: {}  # Set via --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=ARN
+  name: ""

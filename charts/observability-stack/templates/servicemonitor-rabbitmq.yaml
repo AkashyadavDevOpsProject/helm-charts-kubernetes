@@ -1,0 +1,20 @@
+{{- if .Values.rabbitmq.monitoring.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "observability-stack.fullname" . }}-rabbitmq
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "observability-stack.labels" . | nindent 4 }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ required "rabbitmq.monitoring.namespace is required when rabbitmq.monitoring.enabled is true" .Values.rabbitmq.monitoring.namespace | quote }}
+  selector:
+    {{- toYaml .Values.rabbitmq.monitoring.serviceSelector | nindent 4 }}
+  endpoints:
+    - port: metrics
+      interval: 30s
+      path: /metrics
+      scheme: http
+{{- end }}

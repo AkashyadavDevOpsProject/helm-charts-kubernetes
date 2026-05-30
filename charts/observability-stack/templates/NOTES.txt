@@ -1,0 +1,68 @@
+Thank you for installing {{ .Chart.Name }} v{{ .Chart.Version }}
+
+Release:   {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  COMPONENTS DEPLOYED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Prometheus:    {{ if .Values.prometheus.enabled }}✅ ENABLED{{ else }}❌ DISABLED{{ end }}
+  Grafana:       {{ if .Values.grafana.enabled }}✅ ENABLED{{ else }}❌ DISABLED{{ end }}
+  Loki:          {{ if .Values.loki.enabled }}✅ ENABLED{{ else }}❌ DISABLED{{ end }}
+  Alertmanager:  {{ if .Values.prometheus.alertmanager.enabled }}✅ ENABLED{{ else }}❌ DISABLED{{ end }}
+  RabbitMQ Monitor: {{ if .Values.rabbitmq.monitoring.enabled }}✅ ENABLED{{ else }}❌ DISABLED{{ end }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ACCESS GRAFANA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{{- if .Values.grafana.enabled }}
+  1. Port-forward Grafana to your local machine:
+     kubectl port-forward svc/{{ .Release.Name }}-grafana \
+       3000:80 -n {{ .Release.Namespace }}
+
+  2. Open http://localhost:3000
+
+  3. Login with:
+     Username: admin
+     Password: (the value you set for grafana.adminPassword)
+
+  ⚠  WARNING: Change the admin password immediately after first login.
+     kubectl exec -n {{ .Release.Namespace }} deploy/{{ .Release.Name }}-grafana \
+       -- grafana-cli admin reset-admin-password NEW_PASSWORD
+{{- end }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ACCESS PROMETHEUS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{{- if .Values.prometheus.enabled }}
+  kubectl port-forward svc/{{ .Release.Name }}-prometheus-server \
+    9090:80 -n {{ .Release.Namespace }}
+
+  Then open: http://localhost:9090
+{{- end }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  NEXT STEPS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. Verify all pods are running:
+     kubectl get pods -n {{ .Release.Namespace }}
+
+  2. Check Prometheus scrape targets:
+     kubectl port-forward svc/{{ .Release.Name }}-prometheus-server \
+       9090:80 -n {{ .Release.Namespace }}
+     # Then visit http://localhost:9090/targets
+
+  3. Add a custom dashboard via ConfigMap:
+     kubectl create configmap my-dashboard \
+       --from-file=dashboard.json \
+       --namespace={{ .Release.Namespace }}
+     kubectl label configmap my-dashboard grafana_dashboard=1 \
+       --namespace={{ .Release.Namespace }}
+
+  4. Verify PrometheusRule alert rules are loaded:
+     kubectl get prometheusrule -n {{ .Release.Namespace }}
+
+{{- if not .Values.prometheus.alertmanager.config.receivers }}
+  ⚠  WARNING: Alertmanager has no receivers configured.
+     Set grafana.adminPassword and alertmanager Slack webhook to receive alerts.
+{{- end }}

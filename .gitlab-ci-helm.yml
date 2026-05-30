@@ -1,0 +1,206 @@
+---
+# GitLab CI/CD pipeline for Helm chart lint, package, and publish to S3
+# Triggers on pushes to the main branch only.
+
+stages:
+  - lint
+  - package
+  - publish-to-s3
+
+variables:
+  HELM_VERSION: "v3.14.0"
+  KUBECONFORM_VERSION: "v0.6.4"
+  KUBERNETES_VERSION: "1.32.0"
+  CHARTS_DIR: "charts"
+  PACKAGE_DIR: "dist"
+  # S3 bucket and prefix are set as GitLab CI/CD variables in project settings
+  # S3_BUCKET: set in GitLab CI/CD → Settings → Variables
+  # S3_PREFIX: set in GitLab CI/CD → Settings → Variables (e.g. helm-charts)
+  # AWS_DEFAULT_REGION: set in GitLab CI/CD → Settings → Variables
+
+# Only run pipeline on pushes to main branch
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: always
+    - when: never
+
+# ─────────────────────────────────────────────
+# STAGE 1: lint
+# Runs helm lint + kubeconform schema validation
+# on every chart under charts/
+# ─────────────────────────────────────────────
+lint-charts:
+  stage: lint
+  image: alpine:3.19
+  before_script:
+    - apk add --no-cache curl bash git
+    # Install Helm
+    - curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash -s -- --version $HELM_VERSION
+    # Install kubeconform for Kubernetes schema validation
+    - |
+      curl -fsSL \
+        https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz \
+        | tar -xz -C /usr/local/bin
+    - helm version
+    - kubeconform -v
+  script:
+    - |
+      PASS=0
+      FAIL=0
+      FAILED_CHARTS=""
+
+      for chart in $CHARTS_DIR/*/; do
+        CHART_NAME=$(basename "$chart")
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "  Linting: $CHART_NAME"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+        # Update chart dependencies if Chart.lock exists
+        if [ -f "$chart/Chart.yaml" ]; then
+          grep -q "dependencies:" "$chart/Chart.yaml" && helm dependency update "$chart" 2>/dev/null || true
+        fi
+
+        # helm lint
+        if helm lint "$chart" --strict; then
+          echo "  ✅ helm lint PASSED: $CHART_NAME"
+        else
+          echo "  ❌ helm lint FAILED: $CHART_NAME"
+          FAIL=$((FAIL + 1))
+          FAILED_CHARTS="$FAILED_CHARTS $CHART_NAME"
+          continue
+        fi
+
+        # kubeconform schema validation
+        echo ""
+        echo "  Running kubeconform on $CHART_NAME..."
+        if helm template "$chart" \
+          | kubeconform \
+              --strict \
+              --kubernetes-version "$KUBERNETES_VERSION" \
+              --ignore-missing-schemas \
+              --summary; then
+          echo "  ✅ kubeconform PASSED: $CHART_NAME"
+          PASS=$((PASS + 1))
+        else
+          echo "  ❌ kubeconform FAILED: $CHART_NAME"
+          FAIL=$((FAIL + 1))
+          FAILED_CHARTS="$FAILED_CHARTS $CHART_NAME"
+        fi
+      done
+
+      echo ""
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "  Lint Summary"
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "  ✅ PASSED: $PASS charts"
+      echo "  ❌ FAILED: $FAIL charts"
+      if [ -n "$FAILED_CHARTS" ]; then
+        echo "  Failed charts:$FAILED_CHARTS"
+        exit 1
+      fi
+  artifacts:
+    when: always
+    reports:
+      junit: lint-results.xml
+    paths:
+      - lint-results.xml
+    expire_in: 7 days
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# ─────────────────────────────────────────────
+# STAGE 2: package
+# Packages all charts into .tgz archives
+# and regenerates index.yaml
+# ─────────────────────────────────────────────
+package-charts:
+  stage: package
+  image: alpine:3.19
+  needs:
+    - lint-charts
+  before_script:
+    - apk add --no-cache curl bash git
+    - curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash -s -- --version $HELM_VERSION
+    - mkdir -p $PACKAGE_DIR
+  script:
+    - |
+      echo "Packaging all charts..."
+      for chart in $CHARTS_DIR/*/; do
+        CHART_NAME=$(basename "$chart")
+        echo "  📦 Packaging: $CHART_NAME"
+
+        # Update dependencies
+        if grep -q "dependencies:" "$chart/Chart.yaml" 2>/dev/null; then
+          helm dependency update "$chart"
+        fi
+
+        helm package "$chart" --destination "$PACKAGE_DIR"
+        echo "  ✅ Packaged: $CHART_NAME"
+      done
+
+      echo ""
+      echo "  Generating Helm repo index..."
+      helm repo index "$PACKAGE_DIR" \
+        --url "https://akashyadavdevopsproject.github.io/helm-charts-kubernetes"
+
+      echo ""
+      echo "  Packages created:"
+      ls -lh "$PACKAGE_DIR/"
+  artifacts:
+    paths:
+      - $PACKAGE_DIR/
+    expire_in: 30 days
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# ─────────────────────────────────────────────
+# STAGE 3: publish-to-s3
+# Uploads packaged charts and index.yaml to S3
+# Requires AWS credentials set as CI/CD variables:
+#   AWS_ACCESS_KEY_ID       (masked, protected)
+#   AWS_SECRET_ACCESS_KEY   (masked, protected)
+#   AWS_DEFAULT_REGION      (e.g. ap-south-1)
+#   S3_BUCKET               (bucket name only, no s3://)
+#   S3_PREFIX               (e.g. helm-charts — no trailing slash)
+# ─────────────────────────────────────────────
+publish-to-s3:
+  stage: publish-to-s3
+  image:
+    name: amazon/aws-cli:2.15.0
+    entrypoint: [""]
+  needs:
+    - package-charts
+  script:
+    - |
+      echo "Publishing charts to s3://$S3_BUCKET/$S3_PREFIX/"
+
+      # Upload all .tgz packages
+      for pkg in $PACKAGE_DIR/*.tgz; do
+        FILENAME=$(basename "$pkg")
+        echo "  ⬆️  Uploading: $FILENAME"
+        aws s3 cp "$pkg" "s3://$S3_BUCKET/$S3_PREFIX/$FILENAME" \
+          --cache-control "max-age=300" \
+          --no-progress
+      done
+
+      # Upload the index.yaml (short cache — Helm clients refresh this often)
+      echo "  ⬆️  Uploading: index.yaml"
+      aws s3 cp "$PACKAGE_DIR/index.yaml" "s3://$S3_BUCKET/$S3_PREFIX/index.yaml" \
+        --cache-control "max-age=60" \
+        --content-type "application/x-yaml" \
+        --no-progress
+
+      echo ""
+      echo "  ✅ Publish complete."
+      echo "  Helm repo URL: https://$S3_BUCKET.s3.$AWS_DEFAULT_REGION.amazonaws.com/$S3_PREFIX"
+      echo ""
+      echo "  Add the repo with:"
+      echo "    helm repo add akashyadav \\"
+      echo "      https://$S3_BUCKET.s3.$AWS_DEFAULT_REGION.amazonaws.com/$S3_PREFIX"
+      echo "    helm repo update"
+  environment:
+    name: helm-repo
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"

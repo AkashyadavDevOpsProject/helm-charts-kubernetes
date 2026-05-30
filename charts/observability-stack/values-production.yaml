@@ -1,0 +1,222 @@
+# ==============================================================================
+# observability-stack — Production values for FinTech EKS monitoring
+# Region: ap-south-1 (Mumbai)
+#
+# Deploy:
+#   helm upgrade --install observability akashyadav/observability-stack \
+#     --namespace monitoring \
+#     --create-namespace \
+#     -f charts/observability-stack/values-production.yaml \
+#     --set grafana.adminPassword=$GRAFANA_ADMIN_PASSWORD \
+#     --set prometheus.alertmanager.config.receivers[0].slack_configs[0].api_url=$SLACK_WEBHOOK_URL \
+#     --set prometheus.alertmanager.config.receivers[1].pagerduty_configs[0].service_key=$PAGERDUTY_KEY \
+#     --atomic --timeout 15m
+#
+# Pre-requisites:
+#   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+#   helm repo add grafana https://grafana.github.io/helm-charts
+#   helm dependency update charts/observability-stack/
+# ==============================================================================
+
+prometheus:
+  enabled: true
+
+  server:
+    # 30d retention: production needs 30 days of metric history for month-over-month
+    # trend analysis, SLA reporting, and incident post-mortems.
+    # Default was 15d — insufficient for quarterly business reviews.
+    retention: 30d
+
+    persistentVolume:
+      enabled: true
+      storageClass: gp3
+      # 100Gi: sized for ~4M active series across 30 services × 30 days.
+      # Default 50Gi is sufficient for small clusters — production has 30+ services.
+      size: 100Gi
+
+    resources:
+      requests:
+        # 1000m / 4Gi: Prometheus is memory-hungry in production.
+        # Sized for 4M active series — under-resourcing causes OOM kills and metric gaps.
+        cpu: 1000m
+        memory: 4Gi
+      limits:
+        cpu: 4000m
+        # 8Gi limit: protects the node from a cardinality explosion caused by a
+        # misbehaving service adding unbounded label values (e.g. user IDs in metric names).
+        memory: 8Gi
+
+    # global scrape config: 30s is the production standard.
+    # 15s default generates 2x the TSDB write load with marginal freshness gain.
+    global:
+      scrape_interval: 30s
+      evaluation_interval: 30s
+
+  alertmanager:
+    enabled: true
+
+    config:
+      global:
+        resolve_timeout: 5m
+      receivers:
+        - name: slack
+          slack_configs:
+            - api_url: ""  # Set via --set or GitLab CI/CD variable ($SLACK_WEBHOOK_URL)
+              # #platform-alerts: dedicated channel so alerts don't bury dev chat.
+              channel: "#platform-alerts"
+              title: '[{{ .Status | toUpper }}][{{ .CommonLabels.severity | toUpper }}] {{ .GroupLabels.alertname }}'
+              text: '{{ range .Alerts }}*Description:* {{ .Annotations.description }}\n*Runbook:* {{ .Annotations.runbook_url }}\n{{ end }}'
+              send_resolved: true
+        - name: pagerduty
+          pagerduty_configs:
+            - service_key: ""  # Set via --set or GitLab CI/CD variable ($PAGERDUTY_KEY)
+        - name: "null"
+      route:
+        group_by: [alertname, namespace, severity]
+        group_wait: 30s
+        group_interval: 5m
+        # repeat_interval: 4h in production — 12h default is too long for critical alerts.
+        repeat_interval: 4h
+        receiver: slack
+        routes:
+          - match:
+              severity: critical
+            receiver: pagerduty
+            # repeat_interval: 1h for critical — on-call must be re-notified if not resolved.
+            repeat_interval: 1h
+          - match:
+              alertname: Watchdog
+            receiver: "null"
+
+    persistence:
+      enabled: true
+      storageClass: gp3
+      size: 5Gi
+
+  serverFiles:
+    prometheus.yml:
+      scrape_configs:
+        - job_name: prometheus
+          static_configs:
+            - targets:
+                - localhost:9090
+
+grafana:
+  enabled: true
+
+  # adminPassword: NEVER committed to Git — set via --set from CI/CD secret variable.
+  adminPassword: ""  # Set via --set or GitLab CI/CD variable ($GRAFANA_ADMIN_PASSWORD)
+
+  persistence:
+    enabled: true
+    storageClass: gp3
+    # 20Gi: default 10Gi fills up when teams import many dashboards.
+    # Production teams add 50-100 dashboards over time.
+    size: 20Gi
+
+  resources:
+    requests:
+      # 200m / 512Mi: Grafana is mostly idle — resources are for render spikes.
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+  # datasources: URLs use release name 'observability' — if you use a different
+  # release name, update these URLs to match: http://<release>-prometheus-server
+  datasources:
+    datasources.yaml:
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          url: http://observability-prometheus-server
+          isDefault: true
+          access: proxy
+          jsonData:
+            timeInterval: 30s
+        - name: Loki
+          type: loki
+          url: http://observability-loki:3100
+          access: proxy
+
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: default
+          orgId: 1
+          folder: Production
+          type: file
+          disableDeletion: true
+          options:
+            path: /var/lib/grafana/dashboards/default
+
+  grafana.ini:
+    server:
+      # root_url: set to the actual Grafana hostname for correct redirect URIs.
+      # Required for SSO/OAuth integrations with the FinTech IdP.
+      root_url: ""  # Set via --set e.g. https://grafana.monitoring.cashinvoice.in
+    auth.anonymous:
+      # disabled: never allow anonymous access in SOC 2 environments.
+      enabled: false
+    security:
+      allow_embedding: false
+      # cookie_secure: force HTTPS for session cookies — required for SOC 2.
+      cookie_secure: true
+    # smtp: configure for alert email delivery (optional complement to Slack).
+    smtp:
+      enabled: false
+
+loki:
+  enabled: true
+
+  loki:
+    auth_enabled: false
+    commonConfig:
+      replication_factor: 1
+    storage:
+      type: filesystem
+    # limits: production ingestion rate limits to prevent runaway log senders
+    # from exhausting Loki storage (e.g. a misconfigured DEBUG logger).
+    limits_config:
+      ingestion_rate_mb: 16
+      ingestion_burst_size_mb: 32
+      max_label_names_per_series: 30
+      retention_period: 744h  # 31 days of log retention for SOC 2 compliance
+
+  singleBinary:
+    replicas: 1
+    persistence:
+      enabled: true
+      storageClass: gp3
+      # 200Gi: sized for ~3GB/day across 30 services × 31 days + 30% buffer.
+      # Default 50Gi is exhausted in under 3 weeks on a production cluster.
+      size: 200Gi
+    resources:
+      requests:
+        cpu: 500m
+        memory: 512Mi
+      limits:
+        cpu: 2000m
+        memory: 2Gi
+
+  test:
+    enabled: false
+
+  monitoring:
+    selfMonitoring:
+      enabled: false
+      grafanaAgent:
+        installOperator: false
+
+rabbitmq:
+  monitoring:
+    # enabled: true — RabbitMQ is used for async payment event processing.
+    # The alert rule for queue depth > 1000 pages on-call immediately.
+    enabled: false  # Set to true when RabbitMQ is deployed in this cluster
+    namespace: ""   # Set to the namespace where RabbitMQ runs
+    serviceSelector:
+      matchLabels:
+        app.kubernetes.io/name: rabbitmq

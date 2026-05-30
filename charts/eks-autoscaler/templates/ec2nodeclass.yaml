@@ -1,0 +1,58 @@
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: {{ include "eks-autoscaler.fullname" . }}-default
+  labels:
+    {{- include "eks-autoscaler.labels" . | nindent 4 }}
+spec:
+  # amiSelectorTerms: Selects the AMI to use for nodes launched by this class.
+  # al2023@latest resolves to the latest EKS-optimized AL2023 AMI at launch time.
+  amiSelectorTerms:
+    {{- toYaml .Values.ec2NodeClass.amiSelectorTerms | nindent 4 }}
+
+  # role: EC2 instance IAM role name for the node instance profile.
+  # Must have EKS worker node policies attached.
+  role: {{ required "ec2NodeClass.role is required" .Values.ec2NodeClass.role | quote }}
+
+  # subnetSelectorTerms: Karpenter discovers subnets using these tag selectors.
+  subnetSelectorTerms:
+    {{- toYaml .Values.ec2NodeClass.subnetSelectorTerms | nindent 4 }}
+
+  # securityGroupSelectorTerms: Security groups attached to launched nodes.
+  securityGroupSelectorTerms:
+    {{- toYaml .Values.ec2NodeClass.securityGroupSelectorTerms | nindent 4 }}
+
+  # tags: EC2 resource tags applied to instances, volumes, and network interfaces.
+  tags:
+    Name: karpenter-node-{{ required "karpenter.clusterName is required" .Values.karpenter.clusterName }}
+    {{- with .Values.ec2NodeClass.tags }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+
+  # blockDeviceMappings: Root volume configuration for all nodes in this class.
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        # volumeSize: Applies to the general pool setting; GPU pool overrides per NodePool.
+        volumeSize: {{ .Values.karpenter.nodePools.general.volumeSize }}
+        # volumeType: gp3 provides 3000 IOPS baseline at no extra cost vs gp2.
+        volumeType: {{ .Values.karpenter.nodePools.general.volumeType }}
+        # encrypted: Always encrypt EBS volumes — required for SOC 2 compliance.
+        encrypted: {{ .Values.karpenter.nodePools.general.encrypted }}
+        deleteOnTermination: true
+
+  # metadataOptions: IMDSv2 configuration for the instance metadata service.
+  metadataOptions:
+    # httpEndpoint: Must be enabled for IRSA and kubelet to function.
+    httpEndpoint: enabled
+    # httpProtocolIPv6: Disabled unless your VPC uses IPv6.
+    httpProtocolIPv6: disabled
+    # httpPutResponseHopLimit: CRITICAL — must be 2 for EKS pods to reach IMDS.
+    # Default for AL2023 AMIs is 1, which blocks pod-level IMDS calls (IRSA breaks).
+    httpPutResponseHopLimit: {{ .Values.karpenter.nodePools.general.imdsHopLimit }}
+    # httpTokens: required enforces IMDSv2 — blocks IMDSv1 (required for SOC 2).
+    httpTokens: required
+
+  # userData: Additional cloud-init configuration injected into the node bootstrap.
+  # AL2023 uses nodeadm for bootstrapping — leave empty unless you have custom config.
+  userData: ""

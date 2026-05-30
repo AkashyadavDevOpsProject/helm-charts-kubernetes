@@ -1,0 +1,60 @@
+Thank you for installing {{ .Chart.Name }} v{{ .Chart.Version }}
+
+Release:   {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  NODE POOLS DEPLOYED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  General (On-Demand): {{ if .Values.karpenter.nodePools.general.enabled }}✅ ENABLED{{ else }}❌ DISABLED{{ end }}
+  Spot:                {{ if .Values.karpenter.nodePools.spot.enabled }}✅ ENABLED{{ else }}❌ DISABLED{{ end }}
+  GPU (On-Demand):     {{ if .Values.karpenter.nodePools.gpu.enabled }}✅ ENABLED{{ else }}❌ DISABLED{{ end }}
+
+  Cluster:          {{ .Values.karpenter.clusterName }}
+  EC2NodeClass:     {{ include "eks-autoscaler.fullname" . }}-default
+  IMDSv2 Hop Limit: {{ .Values.karpenter.nodePools.general.imdsHopLimit }} (required for IRSA)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  VERIFY KARPENTER IS PROVISIONING NODES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Check NodePools are accepted
+  kubectl get nodepools
+
+  # Check EC2NodeClass is ready
+  kubectl get ec2nodeclasses
+
+  # Watch Karpenter controller logs for provisioning events
+  kubectl logs -n karpenter -l app.kubernetes.io/name=karpenter -f
+
+  # Trigger a scale-up by deploying a pod that needs a new node
+  kubectl get nodes -l karpenter.sh/nodepool={{ include "eks-autoscaler.fullname" . }}-general
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  VERIFY CONSOLIDATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Check disruption/consolidation activity
+  kubectl get nodeclaims
+
+  # Watch for consolidation events
+  kubectl get events --field-selector reason=Consolidation -A
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  USING SPOT NODES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Workloads must add a toleration to schedule on Spot nodes:
+
+    tolerations:
+      - key: karpenter.sh/capacity-type
+        value: spot
+        effect: NoSchedule
+
+  Without this toleration, pods will only schedule on On-Demand nodes.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  IMPORTANT REQUIREMENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ⚠  Karpenter controller must be running in namespace 'karpenter'
+  ⚠  SQS queue '{{ .Values.karpenter.interruptionQueue }}' must exist
+  ⚠  Subnets and security groups must be tagged with:
+       karpenter.sh/discovery: {{ .Values.karpenter.clusterName }}
+  ⚠  IMDSv2 hop limit is set to {{ .Values.karpenter.nodePools.general.imdsHopLimit }} — required for pod IRSA

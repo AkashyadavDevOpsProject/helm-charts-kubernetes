@@ -1,0 +1,62 @@
+{{- if .Values.karpenter.nodePools.gpu.enabled }}
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: {{ include "eks-autoscaler.fullname" . }}-gpu
+  labels:
+    {{- include "eks-autoscaler.labels" . | nindent 4 }}
+spec:
+  template:
+    metadata:
+      labels:
+        karpenter.sh/nodepool: gpu
+        node-type: gpu
+        workload-type: gpu-compute
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: {{ include "eks-autoscaler.fullname" . }}-default
+
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values:
+            {{- toYaml .Values.karpenter.nodePools.gpu.capacityType | nindent 12 }}
+
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values:
+            {{- toYaml .Values.karpenter.nodePools.gpu.instanceTypes | nindent 12 }}
+
+        - key: kubernetes.io/arch
+          operator: In
+          # GPU instances (g4dn, g5) are x86_64 — not Graviton.
+          values:
+            - amd64
+
+        - key: kubernetes.io/os
+          operator: In
+          values:
+            - linux
+
+      # taints: GPU nodes are tainted so only workloads with a matching toleration
+      # will be scheduled here. Prevents non-GPU workloads from consuming expensive GPU nodes.
+      taints:
+        {{- toYaml .Values.karpenter.nodePools.gpu.taints | nindent 8 }}
+
+      # expireAfter: GPU nodes expire after 720h — refresh for patching.
+      expireAfter: 720h
+
+  limits:
+    cpu: {{ .Values.karpenter.nodePools.gpu.limits.cpu | quote }}
+    memory: {{ .Values.karpenter.nodePools.gpu.limits.memory | quote }}
+
+  disruption:
+    consolidationPolicy: {{ .Values.karpenter.nodePools.gpu.disruption.consolidationPolicy }}
+    consolidateAfter: {{ .Values.karpenter.nodePools.gpu.disruption.consolidateAfter }}
+    budgets:
+      - nodes: "1"
+
+  weight: {{ .Values.karpenter.nodePools.gpu.weight }}
+{{- end }}

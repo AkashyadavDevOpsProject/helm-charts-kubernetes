@@ -1,0 +1,73 @@
+Thank you for installing {{ .Chart.Name }} v{{ .Chart.Version }}
+
+Release:   {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  COMPONENTS DEPLOYED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  GitLab Runner: {{ if .Values.gitlab.runner.enabled }}✅ ENABLED ({{ .Values.gitlab.runner.replicas }} replicas × {{ .Values.gitlab.runner.concurrent }} concurrent = {{ mul .Values.gitlab.runner.replicas .Values.gitlab.runner.concurrent }} max jobs){{ else }}❌ DISABLED{{ end }}
+  Trivy Scanner: {{ if .Values.trivy.enabled }}✅ ENABLED (severity: {{ .Values.trivy.severity }}){{ else }}❌ DISABLED{{ end }}
+  Vault Agent:   {{ if .Values.vault.agent.enabled }}✅ ENABLED{{ else }}❌ DISABLED{{ end }}
+  OPA Policies:  {{ if .Values.opa.enabled }}✅ ENABLED{{ else }}❌ DISABLED{{ end }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  VERIFY RUNNER IS REGISTERED IN GITLAB
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. Check runner pods are running:
+     kubectl get pods -n {{ .Release.Namespace }} \
+       -l app.kubernetes.io/name={{ include "devsecops-pipeline.name" . }}
+
+  2. Check runner registration in GitLab:
+     Navigate to {{ .Values.gitlab.runner.gitlabUrl }}/admin/runners
+     OR your project → Settings → CI/CD → Runners
+
+  3. Tail runner logs for registration events:
+     kubectl logs -n {{ .Release.Namespace }} \
+       -l app.kubernetes.io/name={{ include "devsecops-pipeline.name" . }} -f
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  OPA POLICIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{{- if .Values.opa.enabled }}
+  Rego policies are stored in ConfigMap:
+    kubectl get configmap {{ include "devsecops-pipeline.fullname" . }}-opa-policies \
+      -n {{ .Release.Namespace }} -o yaml
+
+  Active policies:
+    requireNonRootUser:    {{ .Values.opa.policies.requireNonRootUser }}
+    requireReadOnlyRootFS: {{ .Values.opa.policies.requireReadOnlyRootFS }}
+    blockLatestTag:        {{ .Values.opa.policies.blockLatestTag }}
+    requireResourceLimits: {{ .Values.opa.policies.requireResourceLimits }}
+    requireTrustedRegistry: {{ .Values.opa.policies.requireTrustedRegistry }}
+
+  To apply via OPA Gatekeeper, create ConstraintTemplates referencing these policies.
+{{- end }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TRIVY USAGE IN PIPELINES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{{- if .Values.trivy.enabled }}
+  Add this stage to your .gitlab-ci.yml:
+
+    trivy-scan:
+      image: {{ .Values.trivy.image.repository }}:{{ .Values.trivy.image.tag }}
+      stage: security
+      script:
+        - trivy image
+            --severity {{ .Values.trivy.severity }}
+            --exit-code {{ .Values.trivy.exitCode }}
+            --ignore-unfixed={{ .Values.trivy.ignoreUnfixed }}
+            --timeout {{ .Values.trivy.timeout }}
+            --cache-dir {{ .Values.trivy.cacheDir }}
+            $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+{{- end }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  IMPORTANT SECURITY NOTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ⚠  Runner token is stored in Secret '{{ include "devsecops-pipeline.runnerSecretName" . }}'.
+     Rotate it immediately if it is ever exposed.
+  ⚠  Runners have RBAC permission to create pods in {{ .Release.Namespace }}.
+     Audit job pod logs regularly for suspicious activity.
+  ⚠  Do NOT enable privileged: true in runner config — this is a critical security boundary.

@@ -1,0 +1,231 @@
+# ==============================================================================
+# microservice — Production values for FinTech payment services on EKS
+# Region: ap-south-1 (Mumbai)
+#
+# Deploy:
+#   helm upgrade --install payments-api akashyadav/microservice \
+#     --namespace production \
+#     --create-namespace \
+#     -f charts/microservice/values-production.yaml \
+#     --set image.repository=123456789.dkr.ecr.ap-south-1.amazonaws.com/payments-api \
+#     --set image.tag=$CI_COMMIT_SHA \
+#     --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::ACCOUNT_ID:role/payments-api-irsa \
+#     --atomic --timeout 10m
+# ==============================================================================
+
+# Production: 3 replicas minimum — one per AZ in ap-south-1 (a, b, c).
+# With topology spread constraints this guarantees AZ-level redundancy.
+replicaCount: 3
+
+image:
+  # repository: Set via --set at deploy time from CI/CD pipeline.
+  # Do NOT hardcode the ECR URI here — it differs between services.
+  repository: ""  # Set via --set or GitLab CI/CD variable
+  # tag: ALWAYS set to the commit SHA in production — never 'latest'.
+  # Immutable tags make rollbacks deterministic and auditable.
+  tag: ""  # Set via --set or GitLab CI/CD variable ($CI_COMMIT_SHA)
+  # IfNotPresent: Safe with immutable SHA tags — avoids unnecessary ECR API calls.
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  # IRSA annotation: grants the pod AWS API access via IAM role, no static credentials.
+  # Role ARN set via --set at deploy time (differs per service).
+  annotations: {}  # Set via --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=ARN
+
+podAnnotations:
+  # Prometheus scrape enabled — every production service must expose /metrics.
+  # Grafana dashboards and alerts depend on this being consistently set.
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8080"
+  prometheus.io/path: "/metrics"
+
+podSecurityContext:
+  runAsNonRoot: true
+  # UID 1000: standard non-root UID used across all services for audit consistency.
+  runAsUser: 1000
+  fsGroup: 2000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  # readOnlyRootFilesystem: true in production — forces all writes to explicit volumes.
+  # Catches misconfigured apps writing to / and improves container immutability.
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 80
+  # targetPort 8080: standard application port used across all FinTech microservices.
+  targetPort: 8080
+  protocol: TCP
+
+ingress:
+  # enabled: true — production services are always exposed via ALB.
+  # Internal ALB (not internet-facing) — only reachable from within the VPC.
+  enabled: true
+  className: "alb"
+  annotations:
+    kubernetes.io/ingress.class: alb
+    # internal: all production payment APIs are VPC-internal only.
+    # internet-facing only for the public-facing API gateway service.
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    # certificate-arn: ACM cert for internal TLS — keeps payment data encrypted in transit.
+    alb.ingress.kubernetes.io/certificate-arn: ""  # Set via --set or GitLab CI/CD variable
+    # health-check: tuned for payment API response time SLA.
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+  hosts:
+    - host: ""  # Set via --set e.g. payments-api.internal.cashinvoice.in
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+resources:
+  requests:
+    # 200m CPU: based on p95 CPU from production load testing of the payments service.
+    # Karpenter uses requests for bin-packing — under-requesting wastes node capacity.
+    cpu: 200m
+    # 256Mi: measured baseline memory at idle + 20% buffer.
+    memory: 256Mi
+  limits:
+    # 1000m: allows 5x burst for payment spikes (e.g. salary day, month-end).
+    cpu: 1000m
+    # 512Mi: hard ceiling — OOMKill before the node is exhausted.
+    # Tuned to stay below 2x request to keep QoS class Burstable.
+    memory: 512Mi
+
+autoscaling:
+  enabled: true
+  # minReplicas: 3 — matches replicaCount, ensures HPA never drops below one-per-AZ.
+  minReplicas: 3
+  # maxReplicas: 30 — sized for peak load testing result (28 pods) + 7% headroom.
+  maxReplicas: 30
+  # 65% CPU threshold: lower than default (70%) to give more headroom before throttling.
+  # Payment processing spikes are sudden — scale before latency degrades.
+  targetCPUUtilizationPercentage: 65
+  targetMemoryUtilizationPercentage: 75
+
+podDisruptionBudget:
+  enabled: true
+  # minAvailable: 2 — with 3+ replicas, always keep 2 up during node drains.
+  # Prevents a rolling drain from taking more than one pod at a time.
+  minAvailable: 2
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  # initialDelaySeconds: 45 — payment service has a Spring Boot init + DB pool warmup.
+  initialDelaySeconds: 45
+  periodSeconds: 10
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    # /ready: returns 200 only when DB connection pool is established and cache is warm.
+    # Prevents the pod from receiving traffic before it can actually process payments.
+    path: /ready
+    port: 8080
+  initialDelaySeconds: 15
+  periodSeconds: 5
+  failureThreshold: 3
+
+startupProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  # 30 × 10s = 5 min startup budget — generous for Spring Boot + Flyway migrations.
+  failureThreshold: 30
+
+networkPolicy:
+  enabled: true
+  # Strict ingress policy: only the ingress namespace and the API gateway can reach this.
+  # All other pods in the cluster are blocked — zero-trust between namespaces.
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: api-gateway
+
+secretsStoreCsi:
+  # enabled: true — payment service reads DB credentials from AWS Secrets Manager,
+  # not from Kubernetes Secrets. Required for SOC 2 audit evidence of secret rotation.
+  enabled: true
+  provider: aws
+  # secretProviderClass: references the SecretProviderClass that defines which
+  # Secrets Manager entries to mount (DB password, payment gateway API key, etc.)
+  secretProviderClass: ""  # Set via --set or GitLab CI/CD variable
+  volumes: []
+  volumeMounts: []
+
+topologySpreadConstraints:
+  - maxSkew: 1
+    # Spread across ap-south-1a, ap-south-1b, ap-south-1c.
+    # DoNotSchedule: never place two pods in the same AZ if one AZ is empty.
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: DoNotSchedule
+
+affinity:
+  podAntiAffinity:
+    # preferredDuringScheduling: soft anti-affinity per node — tries to spread,
+    # but won't block scheduling if nodes are limited. Avoids hard deadlock during scale-up.
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - microservice
+          topologyKey: kubernetes.io/hostname
+
+lifecycle:
+  preStop:
+    exec:
+      # sleep 10: increased from default 5s to 10s.
+      # ALB deregistration takes up to 10s — without this sleep, in-flight payment
+      # requests get a connection reset during rolling updates.
+      command: ["/bin/sh", "-c", "sleep 10"]
+
+# terminationGracePeriodSeconds: 60 — allows in-flight payment transactions to complete.
+# Must be greater than preStop sleep + max payment processing time.
+terminationGracePeriodSeconds: 60
+
+env:
+  - name: ENVIRONMENT
+    value: production
+  - name: LOG_LEVEL
+    value: warn
+  # JAVA_OPTS: production JVM flags — G1GC, container-aware heap sizing,
+  # explicit GC logging for memory leak diagnosis.
+  - name: JAVA_OPTS
+    value: "-XX:+UseG1GC -XX:MaxRAMPercentage=75.0 -Xlog:gc:file=/tmp/gc.log"
+
+envFrom: []
+
+nodeSelector:
+  # Schedule only on On-Demand nodes — payment service must never be on Spot.
+  # Spot interruption mid-transaction causes data inconsistency.
+  karpenter.sh/capacity-type: on-demand
+
+tolerations: []

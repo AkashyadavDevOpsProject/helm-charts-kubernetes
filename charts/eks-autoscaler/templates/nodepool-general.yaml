@@ -1,0 +1,76 @@
+{{- if .Values.karpenter.nodePools.general.enabled }}
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: {{ include "eks-autoscaler.fullname" . }}-general
+  labels:
+    {{- include "eks-autoscaler.labels" . | nindent 4 }}
+spec:
+  # template: Defines the spec for nodes created by this pool.
+  template:
+    metadata:
+      labels:
+        karpenter.sh/nodepool: general
+        node-type: general
+        workload-type: on-demand
+    spec:
+      # nodeClassRef: References the EC2NodeClass that defines AWS-specific config.
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: {{ include "eks-autoscaler.fullname" . }}-default
+
+      # requirements: Constraints on which nodes Karpenter will provision.
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values:
+            {{- toYaml .Values.karpenter.nodePools.general.capacityType | nindent 12 }}
+
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values:
+            {{- toYaml .Values.karpenter.nodePools.general.instanceTypes | nindent 12 }}
+
+        - key: kubernetes.io/arch
+          operator: In
+          # arm64: Graviton instances are arm64. Use amd64 if adding x86 instance types.
+          values:
+            - arm64
+
+        - key: kubernetes.io/os
+          operator: In
+          values:
+            - linux
+
+        - key: karpenter.k8s.aws/instance-generation
+          operator: Gt
+          # Require 6th generation or newer for better performance-per-dollar.
+          values:
+            - "5"
+
+      # taints: None on the general pool — all workloads can schedule here by default.
+      # Add taints to reserve this pool for specific workloads.
+
+      # expireAfter: Nodes in this pool expire and are replaced after 720h (30 days).
+      # Ensures nodes are regularly refreshed with the latest AMI and security patches.
+      expireAfter: 720h
+
+  # limits: Hard ceiling on total resources this pool can provision.
+  # Prevents runaway scaling from misconfigured HPAs or infinite loops.
+  limits:
+    cpu: {{ .Values.karpenter.nodePools.general.limits.cpu | quote }}
+    memory: {{ .Values.karpenter.nodePools.general.limits.memory | quote }}
+
+  # disruption: Controls how Karpenter consolidates and replaces nodes.
+  disruption:
+    consolidationPolicy: {{ .Values.karpenter.nodePools.general.disruption.consolidationPolicy }}
+    consolidateAfter: {{ .Values.karpenter.nodePools.general.disruption.consolidateAfter }}
+    # budgets: Limit how many nodes Karpenter can disrupt at one time.
+    budgets:
+      - nodes: "10%"
+
+  # weight: Used when a pod matches multiple NodePools.
+  # Lower weight means this pool is less preferred than the Spot pool.
+  weight: {{ .Values.karpenter.nodePools.general.weight }}
+{{- end }}

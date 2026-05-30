@@ -1,0 +1,201 @@
+# ==============================================================================
+# eks-autoscaler — Production values for FinTech EKS cluster (ap-south-1)
+# Cluster: prod-eks | Graviton3 On-Demand + Spot mix | Karpenter v1
+#
+# Deploy:
+#   helm upgrade --install autoscaler akashyadav/eks-autoscaler \
+#     --namespace karpenter \
+#     --create-namespace \
+#     -f charts/eks-autoscaler/values-production.yaml \
+#     --set karpenter.clusterName=$EKS_CLUSTER_NAME \
+#     --set karpenter.clusterEndpoint=$EKS_CLUSTER_ENDPOINT \
+#     --set karpenter.interruptionQueue=$KARPENTER_INTERRUPTION_QUEUE \
+#     --set ec2NodeClass.role=$KARPENTER_NODE_ROLE \
+#     --set "ec2NodeClass.subnetSelectorTerms[0].tags.karpenter\.sh/discovery=$EKS_CLUSTER_NAME" \
+#     --set "ec2NodeClass.securityGroupSelectorTerms[0].tags.karpenter\.sh/discovery=$EKS_CLUSTER_NAME" \
+#     --atomic --timeout 5m
+# ==============================================================================
+
+karpenter:
+  # clusterName: set via --set from GitLab CI/CD variable — never hardcode.
+  clusterName: ""  # Set via --set or GitLab CI/CD variable ($EKS_CLUSTER_NAME)
+
+  # clusterEndpoint: EKS API server URL — changes between clusters.
+  clusterEndpoint: ""  # Set via --set or GitLab CI/CD variable ($EKS_CLUSTER_ENDPOINT)
+
+  # interruptionQueue: SQS queue for Spot interruption notices.
+  # Created by Terraform alongside the cluster — name follows convention CLUSTER-karpenter-interruption.
+  interruptionQueue: ""  # Set via --set or GitLab CI/CD variable
+
+  nodePools:
+    general:
+      enabled: true
+      # instanceTypes: Graviton3 first, Graviton2 as fallback.
+      # m7g over m6g: ~15% better performance-per-dollar. m6g is fallback
+      # for capacity in ap-south-1 during regional demand spikes.
+      instanceTypes:
+        - m7g.large
+        - m7g.xlarge
+        - m7g.2xlarge
+        - m7g.4xlarge
+        - m6g.large
+        - m6g.xlarge
+        - m6g.2xlarge
+      capacityType:
+        - on-demand
+      # AL2023: required for EKS 1.29+ and provides better security defaults
+      # than AL2. Mandatory for our SOC 2 compliance posture.
+      amiFamily: AL2023
+      # 100Gi root volume: increased from default 50Gi.
+      # Production container images for JVM services are 1-3GB after layers.
+      # 50Gi fills up when pulling multiple image versions on a busy build node.
+      volumeSize: 100Gi
+      volumeType: gp3
+      # encrypted: always true — EBS encryption is a SOC 2 hard requirement.
+      encrypted: true
+      # imdsHopLimit: 2 is critical — without this, IRSA token requests from pods
+      # fail silently, causing seemingly random AWS API AccessDenied errors.
+      imdsHopLimit: 2
+      limits:
+        # 200 vCPU cap: prevents runaway HPA from provisioning unlimited nodes.
+        # Sized to handle 3x our peak load (67 vCPU observed) with headroom.
+        cpu: "200"
+        memory: 800Gi
+      disruption:
+        consolidationPolicy: WhenUnderutilized
+        # 5m consolidation delay: increased from 30s default.
+        # 30s causes excessive node churn for JVM services with 60s startup times.
+        # A node that looks underutilised during startup would be immediately consolidated.
+        consolidateAfter: 5m
+      weight: 10
+
+    spot:
+      enabled: true
+      # Wide instance diversity: 6 families × 4 sizes = 24 combinations.
+      # More diversity = better Spot availability when AWS reclaims one pool.
+      # In ap-south-1, c6g and r6g frequently have better Spot pricing than m-family.
+      instanceTypes:
+        - m7g.large
+        - m7g.xlarge
+        - m7g.2xlarge
+        - m6g.large
+        - m6g.xlarge
+        - m6g.2xlarge
+        - c7g.large
+        - c7g.xlarge
+        - c7g.2xlarge
+        - c6g.large
+        - c6g.xlarge
+        - c6g.2xlarge
+        - r7g.large
+        - r7g.xlarge
+        - r6g.large
+        - r6g.xlarge
+      capacityType:
+        - spot
+      amiFamily: AL2023
+      volumeSize: 100Gi
+      volumeType: gp3
+      encrypted: true
+      imdsHopLimit: 2
+      limits:
+        # 400 vCPU Spot cap: 2x On-Demand because Spot is ~70% cheaper.
+        # Batch jobs and async workers run entirely on Spot — they tolerate interruption.
+        cpu: "400"
+        memory: 1600Gi
+      disruption:
+        # WhenEmpty: conservative Spot consolidation — only remove empty nodes.
+        # WhenUnderutilized would cause unnecessary churn on Spot; Spot nodes
+        # are already short-lived due to interruptions.
+        consolidationPolicy: WhenEmpty
+        consolidateAfter: 2m
+      weight: 50
+
+    gpu:
+      # enabled: false — no ML workloads in current production scope.
+      # Enable when the fraud detection ML model is moved to this cluster.
+      enabled: false
+      instanceTypes:
+        - g4dn.xlarge
+        - g4dn.2xlarge
+        - g5.xlarge
+      capacityType:
+        - on-demand
+      amiFamily: AL2023
+      volumeSize: 200Gi
+      volumeType: gp3
+      encrypted: true
+      imdsHopLimit: 2
+      taints:
+        - key: nvidia.com/gpu
+          value: "true"
+          effect: NoSchedule
+      limits:
+        cpu: "50"
+        memory: 200Gi
+      disruption:
+        consolidationPolicy: WhenEmpty
+        consolidateAfter: 300s
+      weight: 5
+
+ec2NodeClass:
+  amiSelectorTerms:
+    # al2023@latest: always use the most recent EKS-optimised AL2023 AMI.
+    # We accept the minor risk of AMI changes — our CI pipeline validates
+    # node bootstrapping on every cluster version upgrade.
+    - alias: al2023@latest
+
+  # role: EC2 instance profile IAM role name (NOT the ARN).
+  # Created by Terraform module — name convention: KarpenterNodeRole-CLUSTER_NAME.
+  role: ""  # Set via --set or GitLab CI/CD variable ($KARPENTER_NODE_ROLE)
+
+  subnetSelectorTerms:
+    - tags:
+        # Discovery tag set on private subnets by Terraform — value = cluster name.
+        karpenter.sh/discovery: ""  # Set via --set (same as clusterName)
+
+  securityGroupSelectorTerms:
+    - tags:
+        # Discovery tag set on the node security group by Terraform.
+        karpenter.sh/discovery: ""  # Set via --set (same as clusterName)
+
+  tags:
+    # Environment tag: used in AWS Cost Explorer to separate prod/staging spend.
+    Environment: production
+    ManagedBy: karpenter
+    # CostCenter: maps to FinTech cost allocation code for cloud billing.
+    CostCenter: platform-engineering
+    # Compliance tag: required by security team for asset inventory audits.
+    DataClassification: confidential
+
+hpa:
+  defaults:
+    minReplicas: 3
+    maxReplicas: 50
+    # 65% CPU threshold: more aggressive scale-out than default 70%.
+    # Payment workloads spike suddenly — scale before latency degrades.
+    cpuThreshold: 65
+    memoryThreshold: 75
+    # 600s scale-down window: 10 minutes before scaling down.
+    # Prevents flapping during the busy-hour traffic wave pattern seen in ap-south-1.
+    scaleDownStabilizationWindowSeconds: 600
+
+vpa:
+  # enabled: false — VPA Auto mode is too disruptive for stateless payment APIs.
+  # We run VPA in Off mode (recommendation-only) and apply resource changes
+  # manually after reviewing recommendations in Grafana.
+  enabled: false
+  updateMode: "Off"
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ""
+  resourcePolicy:
+    containerPolicies:
+      - containerName: "*"
+        minAllowed:
+          cpu: 100m
+          memory: 128Mi
+        maxAllowed:
+          cpu: 8000m
+          memory: 16Gi

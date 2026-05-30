@@ -1,0 +1,103 @@
+{{- if and .Values.postgresql.enabled .Values.backup.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "postgresql-ha.fullname" . }}-backup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "postgresql-ha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  timeZone: "UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: {{ .Values.backup.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.backup.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            {{- include "postgresql-ha.labels" . | nindent 12 }}
+            app.kubernetes.io/component: backup
+        spec:
+          serviceAccountName: {{ include "postgresql-ha.serviceAccountName" . }}
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            fsGroup: 999
+          containers:
+            - name: backup
+              image: "{{ .Values.backup.image.repository }}:{{ .Values.backup.image.tag }}"
+              imagePullPolicy: {{ .Values.backup.image.pullPolicy }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: false
+                capabilities:
+                  drop:
+                    - ALL
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -euo pipefail
+
+                  TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+                  BACKUP_FILE="/tmp/backup_${TIMESTAMP}.sql.gz"
+                  S3_KEY="{{ .Values.backup.s3Prefix }}/${BACKUP_FILE##*/}"
+
+                  echo "Starting backup at ${TIMESTAMP}..."
+                  echo "Target: s3://{{ required "backup.s3Bucket is required when backup.enabled is true" .Values.backup.s3Bucket }}/${S3_KEY}"
+
+                  # Dump the database, compress, and stream to S3
+                  PGPASSWORD="${POSTGRES_PASSWORD}" pg_dump \
+                    --host="${PGHOST}" \
+                    --port=5432 \
+                    --username="${PGUSER}" \
+                    --dbname="${PGDATABASE}" \
+                    --format=custom \
+                    --compress=9 \
+                    --file="${BACKUP_FILE}"
+
+                  echo "Dump complete. Uploading to S3..."
+
+                  # Install AWS CLI if not present (base postgres image doesn't have it)
+                  if ! command -v aws &>/dev/null; then
+                    apt-get update -qq && apt-get install -qq -y awscli
+                  fi
+
+                  aws s3 cp "${BACKUP_FILE}" \
+                    "s3://{{ .Values.backup.s3Bucket }}/${S3_KEY}" \
+                    --region {{ required "backup.s3Region is required when backup.enabled is true" .Values.backup.s3Region }} \
+                    --no-progress
+
+                  echo "Backup uploaded: s3://{{ .Values.backup.s3Bucket }}/${S3_KEY}"
+
+                  # Clean up local file
+                  rm -f "${BACKUP_FILE}"
+                  echo "Backup complete."
+              env:
+                - name: PGHOST
+                  value: {{ include "postgresql-ha.fullname" . }}-primary
+                - name: PGUSER
+                  value: {{ .Values.postgresql.auth.username | default "postgres" | quote }}
+                - name: PGDATABASE
+                  value: {{ .Values.postgresql.auth.database | default "postgres" | quote }}
+                - name: POSTGRES_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "postgresql-ha.secretName" . }}
+                      key: {{ .Values.postgresql.auth.secretKeys.adminPasswordKey }}
+                - name: AWS_DEFAULT_REGION
+                  value: {{ .Values.backup.s3Region | quote }}
+              resources:
+                {{- toYaml .Values.backup.resources | nindent 16 }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: 5Gi
+{{- end }}

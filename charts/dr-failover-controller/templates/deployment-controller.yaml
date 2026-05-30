@@ -1,0 +1,102 @@
+{{- if .Values.controller.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dr-failover-controller.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dr-failover-controller.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.controller.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "dr-failover-controller.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dr-failover-controller.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "dr-failover-controller.serviceAccountName" . }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: controller
+          image: "{{ .Values.controller.image.repository }}:{{ .Values.controller.image.tag }}"
+          imagePullPolicy: {{ .Values.controller.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - ALL
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "DR Failover Controller started at $(date -u)"
+              echo "Primary region: ${AWS_PRIMARY_REGION}"
+              echo "DR region: ${AWS_DR_REGION}"
+              echo "Auto failover: ${AUTO_FAILOVER}"
+              echo "Monitoring primary: ${PRIMARY_ENDPOINT}"
+              echo ""
+              echo "Controller is running. Health checks execute via CronJob."
+              echo "Manual failover: exec into this pod and run /scripts/execute-failover.sh"
+              # Keep the controller alive for exec access and state observation
+              while true; do
+                sleep 60
+                echo "[$(date -u)] Controller heartbeat — DR status: active, primary: ${PRIMARY_ENDPOINT}"
+              done
+          env:
+            - name: PRIMARY_ENDPOINT
+              value: {{ .Values.controller.healthChecks.primary.endpoint | quote }}
+            - name: AWS_PRIMARY_REGION
+              value: {{ .Values.controller.aws.region | quote }}
+            - name: AWS_DR_REGION
+              value: {{ .Values.controller.aws.drRegion | quote }}
+            - name: AWS_DEFAULT_REGION
+              value: {{ .Values.controller.aws.region | quote }}
+            - name: ROUTE53_HOSTED_ZONE_ID
+              value: {{ .Values.controller.failover.route53.hostedZoneId | quote }}
+            - name: ROUTE53_PRIMARY_RECORD
+              value: {{ .Values.controller.failover.route53.primaryRecordName | quote }}
+            - name: ROUTE53_DR_RECORD
+              value: {{ .Values.controller.failover.route53.drRecordName | quote }}
+            - name: AUTO_FAILOVER
+              value: {{ .Values.controller.failover.route53.autoFailover | quote }}
+            - name: SNS_ENABLED
+              value: {{ .Values.controller.failover.sns.enabled | quote }}
+            - name: SNS_TOPIC_ARN
+              value: {{ .Values.controller.failover.sns.topicArn | quote }}
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          {{- if .Values.metrics.enabled }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+          {{- end }}
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ include "dr-failover-controller.fullname" . }}-scripts
+            defaultMode: 0755
+        - name: tmp
+          emptyDir: {}
+{{- end }}

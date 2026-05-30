@@ -1,0 +1,74 @@
+Thank you for installing {{ .Chart.Name }} v{{ .Chart.Version }}
+
+Release:   {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  DR CONFIGURATION SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Primary Region:    {{ .Values.controller.aws.region }}
+  DR Region:         {{ .Values.controller.aws.drRegion }}
+  Health Check:      {{ .Values.controller.healthChecks.primary.endpoint }}
+  Check Interval:    {{ .Values.controller.schedule }}
+  Failure Threshold: {{ .Values.controller.healthChecks.primary.consecutiveFailures }} consecutive failures
+
+  Route 53 Zone:     {{ .Values.controller.failover.route53.hostedZoneId }}
+  Primary Record:    {{ .Values.controller.failover.route53.primaryRecordName }}
+  DR Record:         {{ .Values.controller.failover.route53.drRecordName }}
+
+  Aurora Check:      {{ .Values.controller.healthChecks.aurora.checkEnabled }}
+  ElastiCache Check: {{ .Values.controller.healthChecks.elasticache.checkEnabled }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  FAILOVER MODE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{{- if .Values.controller.failover.route53.autoFailover }}
+  🔴 AUTO FAILOVER: ENABLED
+     Route 53 will be updated AUTOMATICALLY when the failure threshold is reached.
+     This is irreversible without manual intervention. Verify this is intentional.
+{{- else }}
+  🟡 AUTO FAILOVER: DISABLED (manual approval required)
+     When failure threshold is reached, an SNS notification will be sent.
+     To execute failover manually:
+       kubectl exec -n {{ .Release.Namespace }} \
+         $(kubectl get pod -n {{ .Release.Namespace }} -l app.kubernetes.io/name={{ include "dr-failover-controller.name" . }} -o name | head -1) \
+         -- /scripts/execute-failover.sh
+{{- end }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  VERIFY HEALTH CHECKS ARE RUNNING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Check CronJob status
+  kubectl get cronjob -n {{ .Release.Namespace }} \
+    {{ include "dr-failover-controller.fullname" . }}-healthcheck
+
+  # View last job execution logs
+  kubectl logs -n {{ .Release.Namespace }} \
+    -l app.kubernetes.io/component=healthcheck --tail=50
+
+  # Trigger an immediate health check (dry-run, does not trigger failover)
+  kubectl create job --from=cronjob/{{ include "dr-failover-controller.fullname" . }}-healthcheck \
+    manual-check-$(date +%s) -n {{ .Release.Namespace }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  GRAFANA DASHBOARD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{{- if .Values.grafana.dashboard.enabled }}
+  DR status dashboard deployed as ConfigMap.
+  Label for Grafana auto-discovery: {{ range $k,$v := .Values.grafana.dashboard.labels }}{{ $k }}={{ $v }}{{ end }}
+
+  View in Grafana under "DR Failover Controller" dashboard.
+{{- end }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  CRITICAL WARNINGS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ⚠  IRSA annotation MUST be set on the ServiceAccount for AWS API access.
+     Without it, Route 53 and SNS calls will fail with AccessDenied.
+     Set: --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=ROLE_ARN
+
+  ⚠  Test your failback procedure BEFORE your first real DR event.
+     Failover is easy; failing back without data loss requires preparation.
+
+  ⚠  Aurora and ElastiCache in the DR region must be pre-warmed.
+     DNS failover is instant; data replication catch-up is not.

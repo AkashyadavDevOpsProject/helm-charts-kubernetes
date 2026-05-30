@@ -1,0 +1,38 @@
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# Documentation — README.md is excluded from the package; it lives in the repo only.
+# templates/NOTES.txt is NOT excluded — it is rendered post-install by helm.
+# *.txt is intentionally omitted from this list for the same reason.
+*.md
+
+# Test files
+tests/
+test/
+*_test.yaml
+*_test.go
+
+# CI/CD files — pipeline config does not belong inside a packaged chart
+.gitlab-ci*.yml
+Jenkinsfile
+.github/
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+Thumbs.db
+
+# Development values overrides — only values.yaml is packaged.
+# values-production.yaml, values-dev.yaml, values-staging.yaml etc. are excluded.
+# Note: values-*.yaml does NOT match values.yaml (requires a literal dash).
+values-*.yaml
+
+# Temporary and backup files
+*.tmp
+*.bak
+*.orig

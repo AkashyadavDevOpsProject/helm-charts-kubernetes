@@ -1,0 +1,29 @@
+apiVersion: v2
+name: postgresql-ha
+description: |
+  PostgreSQL High Availability on Kubernetes with streaming replication,
+  PgBouncer connection pooling, automated S3 backup via CronJob, and
+  Prometheus metrics exporter. Implements the database pattern for stateful
+  workloads on production EKS clusters — gp3 persistent storage, NetworkPolicy
+  for access control, and configurable failover. Suitable for moderate workloads
+  requiring HA without the cost of Amazon RDS.
+type: application
+version: 1.0.0
+appVersion: "16.2.0"
+keywords:
+  - postgresql
+  - ha
+  - pgbouncer
+  - s3-backup
+  - replication
+  - database
+  - stateful
+  - eks
+  - fintech
+home: https://github.com/AkashyadavDevOpsProject/helm-charts-kubernetes
+sources:
+  - https://github.com/AkashyadavDevOpsProject/helm-charts-kubernetes/tree/main/charts/postgresql-ha
+maintainers:
+  - name: Akash Yadav
+    email: akashyadavdevops@gmail.com
+    url: https://linkedin.com/in/akash-yadav-devops

@@ -1,0 +1,116 @@
+{{- if and .Values.postgresql.enabled (gt (int .Values.postgresql.replicaCount) 1) }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "postgresql-ha.fullname" . }}-replica
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "postgresql-ha.labels" . | nindent 4 }}
+    app.kubernetes.io/component: replica
+spec:
+  serviceName: {{ include "postgresql-ha.fullname" . }}-replica-headless
+  replicas: {{ sub (int .Values.postgresql.replicaCount) 1 }}
+  selector:
+    matchLabels:
+      {{- include "postgresql-ha.replicaSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "postgresql-ha.labels" . | nindent 8 }}
+        app.kubernetes.io/component: replica
+    spec:
+      serviceAccountName: {{ include "postgresql-ha.serviceAccountName" . }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: postgresql
+          image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
+          imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: BITNAMI_DEBUG
+              value: "false"
+            - name: POSTGRESQL_VOLUME_DIR
+              value: "/bitnami/postgresql"
+            - name: PGDATA
+              value: "/bitnami/postgresql/data"
+            - name: POSTGRES_USER
+              value: {{ .Values.postgresql.auth.username | default "postgres" | quote }}
+            - name: POSTGRES_DB
+              value: {{ .Values.postgresql.auth.database | default "postgres" | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "postgresql-ha.secretName" . }}
+                  key: {{ .Values.postgresql.auth.secretKeys.adminPasswordKey }}
+            - name: REPMGR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "postgresql-ha.secretName" . }}
+                  key: {{ .Values.postgresql.auth.secretKeys.replicationPasswordKey }}
+            - name: REPMGR_PRIMARY_HOST
+              value: {{ include "postgresql-ha.fullname" . }}-primary-0.{{ include "postgresql-ha.fullname" . }}-primary-headless.{{ .Release.Namespace }}.svc.cluster.local
+            - name: REPMGR_PARTNER_NODES
+              value: {{ include "postgresql-ha.fullname" . }}-primary-0.{{ include "postgresql-ha.fullname" . }}-primary-headless.{{ .Release.Namespace }}.svc.cluster.local
+            - name: REPMGR_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: REPMGR_NODE_NETWORK_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - name: postgresql
+              containerPort: 5432
+              protocol: TCP
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - exec pg_isready -U {{ .Values.postgresql.auth.username | default "postgres" | quote }} -h 127.0.0.1 -p 5432
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - exec pg_isready -U {{ .Values.postgresql.auth.username | default "postgres" | quote }} -h 127.0.0.1 -p 5432
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.postgresql.replica.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /bitnami/postgresql
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "postgresql-ha.labels" . | nindent 10 }}
+          app.kubernetes.io/component: replica
+      spec:
+        accessModes:
+          {{- toYaml .Values.postgresql.replica.persistence.accessModes | nindent 10 }}
+        storageClassName: {{ .Values.postgresql.replica.persistence.storageClass | quote }}
+        resources:
+          requests:
+            storage: {{ .Values.postgresql.replica.persistence.size | quote }}
+{{- end }}

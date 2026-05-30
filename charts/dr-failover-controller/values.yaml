@@ -1,0 +1,163 @@
+# ------------------------------------------------------------------------------
+# dr-failover-controller Helm chart values
+# CRITICAL: autoFailover defaults to false — fully automated DNS failover
+# must be explicitly enabled. Test thoroughly in staging before enabling.
+# All AWS resource identifiers must be set via --set or values file.
+# ------------------------------------------------------------------------------
+
+# nameOverride: Overrides the chart name portion of generated resource names.
+nameOverride: ""
+# fullnameOverride: Completely overrides the generated resource name.
+fullnameOverride: ""
+
+controller:
+  # enabled: Set false to temporarily disable the DR controller without uninstalling.
+  enabled: true
+
+  # replicaCount: Number of controller Deployment pods.
+  # 2 for HA — if one pod is evicted, health checks continue uninterrupted.
+  replicaCount: 2
+
+  image:
+    # repository: AWS CLI image — used to query Route 53, SNS, Aurora, ElastiCache.
+    repository: amazon/aws-cli
+    # tag: Pin to a specific version for reproducible builds.
+    tag: "2.15.0"
+    pullPolicy: IfNotPresent
+
+  # schedule: How often the health check CronJob fires.
+  # Every 5 minutes balances detection speed against API call cost.
+  schedule: "*/5 * * * *"
+
+  healthChecks:
+    primary:
+      # endpoint: REQUIRED. HTTP/HTTPS URL to probe for primary region health.
+      # Should return 200 when the primary region is fully operational.
+      # Example: https://api.primary.example.com/health
+      endpoint: ""
+
+      # expectedStatusCode: HTTP status code that indicates a healthy primary.
+      expectedStatusCode: 200
+
+      # timeoutSeconds: Maximum seconds to wait for the health check response.
+      timeoutSeconds: 10
+
+      # consecutiveFailures: Number of consecutive failed checks before triggering
+      # the failover workflow. 3 × 5min = 15min worst-case detection time.
+      consecutiveFailures: 3
+
+    aurora:
+      # checkEnabled: Set true to include Aurora replication lag in health checks.
+      checkEnabled: true
+
+      # replicationLagThresholdSeconds: Alert if replica lag exceeds this value.
+      # 30s means read replicas in the DR region may be up to 30s stale.
+      replicationLagThresholdSeconds: 30
+
+      # clusterIdentifier: Aurora cluster resource identifier in the primary region.
+      # Get it from: aws rds describe-db-clusters --query 'DBClusters[*].DBClusterIdentifier'
+      clusterIdentifier: ""
+
+    elasticache:
+      # checkEnabled: Set true to include ElastiCache availability in health checks.
+      checkEnabled: true
+
+      # primaryEndpoint: ElastiCache primary endpoint to probe (Redis/Memcached).
+      # Checked via TCP connect — does not require auth credentials.
+      primaryEndpoint: ""
+
+  failover:
+    route53:
+      # hostedZoneId: REQUIRED. Route 53 hosted zone ID containing the failover records.
+      # Get it from: aws route53 list-hosted-zones --query 'HostedZones[*].[Name,Id]'
+      hostedZoneId: ""
+
+      # primaryRecordName: DNS record name pointing to the primary region endpoint.
+      # Example: api.example.com
+      primaryRecordName: ""
+
+      # drRecordName: DNS record name pointing to the DR region endpoint.
+      # Example: api-dr.example.com
+      drRecordName: ""
+
+      # autoFailover: DANGER. When true, Route 53 failover is triggered automatically
+      # without human approval. Only enable after extensive DR drills in staging.
+      # Default is false — requireManualApproval must also be false for auto to work.
+      autoFailover: false
+
+      # requireManualApproval: When true, an SNS notification is sent and the
+      # controller waits for a manual trigger before executing the failover.
+      # Recommended for production until DR procedures are well-rehearsed.
+      requireManualApproval: true
+
+    sns:
+      # enabled: Send SNS notifications for health check failures and failover events.
+      enabled: true
+
+      # topicArn: REQUIRED if sns.enabled is true.
+      # SNS topic ARN for DR alerts. The controller's IAM role must have sns:Publish.
+      # Example: arn:aws:sns:ap-south-1:123456789012:dr-alerts
+      topicArn: ""
+
+      # alertOnHealthCheckFail: Send a notification when health checks fail.
+      alertOnHealthCheckFail: true
+
+      # alertOnFailoverTrigger: Send a notification when failover is triggered.
+      alertOnFailoverTrigger: true
+
+      # alertOnDRActivation: Send a notification when DR region becomes active.
+      alertOnDRActivation: true
+
+  aws:
+    # region: AWS region of the primary deployment.
+    region: "ap-south-1"
+
+    # drRegion: AWS region of the DR (standby) deployment.
+    drRegion: "ap-south-2"
+
+    # roleArn: IRSA role ARN with permissions for Route53, SNS, RDS, ElastiCache.
+    # Required permissions: route53:ChangeResourceRecordSets, route53:GetHealthCheck,
+    #   sns:Publish, rds:DescribeDBClusters, elasticache:DescribeReplicationGroups
+    # Set via: serviceAccount.annotations.eks.amazonaws.com/role-arn
+    roleArn: ""
+
+# ──────────────────────────────────────────────
+# ServiceAccount (for IRSA)
+# ──────────────────────────────────────────────
+serviceAccount:
+  # create: Create a ServiceAccount for the controller.
+  create: true
+  # annotations: REQUIRED. Add IRSA annotation to grant AWS API permissions.
+  # Example: eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT:role/dr-controller-role
+  annotations: {}
+  name: ""
+
+rbac:
+  # create: Create ClusterRole and ClusterRoleBinding for the controller.
+  # Needs read access to Pod and Node resources for cluster health assessment.
+  create: true
+
+# ──────────────────────────────────────────────
+# Prometheus metrics
+# ──────────────────────────────────────────────
+metrics:
+  # enabled: Expose DR status metrics on a dedicated port for Prometheus scraping.
+  enabled: true
+  # port: Port where the metrics endpoint is exposed.
+  port: 9090
+  serviceMonitor:
+    # enabled: Create a ServiceMonitor for Prometheus Operator.
+    enabled: true
+    # interval: How often Prometheus scrapes the DR controller metrics.
+    interval: 30s
+
+# ──────────────────────────────────────────────
+# Grafana dashboard
+# ──────────────────────────────────────────────
+grafana:
+  dashboard:
+    # enabled: Create a ConfigMap containing the Grafana DR status dashboard JSON.
+    enabled: true
+    # labels: Labels for Grafana auto-discovery of the dashboard ConfigMap.
+    labels:
+      grafana_dashboard: "1"

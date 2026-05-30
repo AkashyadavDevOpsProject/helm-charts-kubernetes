@@ -1,0 +1,18 @@
+{{- if and .Values.postgresql.metrics.enabled .Values.postgresql.metrics.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "postgresql-ha.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "postgresql-ha.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "postgresql-ha.primarySelectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.postgresql.metrics.serviceMonitor.interval }}
+      path: /metrics
+      scheme: http
+{{- end }}

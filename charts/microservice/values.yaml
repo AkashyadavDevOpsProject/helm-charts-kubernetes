@@ -1,0 +1,267 @@
+# ------------------------------------------------------------------------------
+# microservice Helm chart values
+# All sensitive values default to "" — set via --set or existingSecret pattern.
+# Override values using: helm install --set key=value or -f values-prod.yaml
+# ------------------------------------------------------------------------------
+
+# replicaCount: Minimum number of pod replicas. HPA will scale above this.
+replicaCount: 2
+
+image:
+  # repository: Required. Container image URI.
+  # Example: 123456789.dkr.ecr.ap-south-1.amazonaws.com/my-api
+  repository: ""
+  # tag: Image tag. Always use an immutable tag (commit SHA) in production.
+  # Never use 'latest' in production — it makes rollbacks impossible.
+  tag: "latest"
+  # pullPolicy: When to pull the image from the registry.
+  # IfNotPresent is safe with immutable tags. Use Always with mutable tags.
+  pullPolicy: IfNotPresent
+
+# imagePullSecrets: List of Kubernetes secret names for private registry auth.
+# Example: [{name: ecr-pull-secret}]
+imagePullSecrets: []
+
+# nameOverride: Overrides the chart name portion of generated resource names.
+nameOverride: ""
+# fullnameOverride: Completely overrides the generated resource name.
+# When set, all resources use this name instead of release-chart format.
+fullnameOverride: ""
+
+serviceAccount:
+  # create: Whether to create a new ServiceAccount resource.
+  # Set false to use a pre-existing ServiceAccount.
+  create: true
+  # annotations: Annotations to add to the ServiceAccount.
+  # IRSA: add eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/ROLE_NAME
+  # to grant the pod AWS API permissions without static credentials.
+  annotations: {}
+  # name: Name of the ServiceAccount. Leave empty to auto-generate from fullname.
+  name: ""
+
+podAnnotations:
+  # prometheus.io/scrape: Tells Prometheus to scrape this pod for metrics.
+  prometheus.io/scrape: "true"
+  # prometheus.io/port: Port where the /metrics endpoint is exposed.
+  prometheus.io/port: "8080"
+  # prometheus.io/path: HTTP path where Prometheus scrapes metrics.
+  prometheus.io/path: "/metrics"
+
+podSecurityContext:
+  # runAsNonRoot: Kubernetes will reject pods that try to run as root (UID 0).
+  runAsNonRoot: true
+  # runAsUser: The UID to run the container process as. 1000 is a safe default.
+  runAsUser: 1000
+  # fsGroup: All volumes mounted into the container will be owned by this GID.
+  # Required for applications that need write access to mounted volumes.
+  fsGroup: 2000
+
+securityContext:
+  # allowPrivilegeEscalation: Prevents the process from gaining more privileges
+  # than its parent. Always set false in production.
+  allowPrivilegeEscalation: false
+  # readOnlyRootFilesystem: Mounts the container root filesystem as read-only.
+  # Applications that need to write files must use emptyDir or mounted volumes.
+  readOnlyRootFilesystem: true
+  capabilities:
+    # drop: Remove all Linux capabilities. Add back only what the app requires.
+    # Most web services need zero capabilities.
+    drop:
+      - ALL
+
+service:
+  # type: Kubernetes service type.
+  # ClusterIP for internal services (use ALB Ingress for external access).
+  # NodePort or LoadBalancer only for non-production or special cases.
+  type: ClusterIP
+  # port: The port that Kubernetes exposes on the Service.
+  port: 80
+  # targetPort: The port on the container that traffic is forwarded to.
+  targetPort: 8080
+  # protocol: Network protocol for the service port.
+  protocol: TCP
+
+ingress:
+  # enabled: Set true to create an Ingress resource.
+  # Requires the AWS ALB Ingress Controller to be installed in the cluster.
+  enabled: false
+  # className: Ingress class. 'alb' for AWS Application Load Balancer.
+  className: "alb"
+  # annotations: ALB Ingress Controller annotations for routing configuration.
+  annotations:
+    kubernetes.io/ingress.class: alb
+    # scheme: 'internal' for VPC-only access, 'internet-facing' for public.
+    alb.ingress.kubernetes.io/scheme: internal
+    # target-type: 'ip' registers pod IPs directly. Required for EKS with VPC CNI.
+    alb.ingress.kubernetes.io/target-type: ip
+    # listen-ports: Ports the ALB listens on. HTTPS only is the production default.
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    # ssl-redirect: Redirects HTTP traffic to HTTPS automatically.
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+  hosts:
+    - # host: Required when ingress is enabled. DNS name for the service.
+      # Example: api.internal.example.com
+      host: ""
+      paths:
+        - path: /
+          pathType: Prefix
+  # tls: TLS configuration for HTTPS termination at the ingress.
+  tls: []
+
+resources:
+  requests:
+    # cpu: Guaranteed CPU allocation. Karpenter uses this for bin-packing decisions.
+    # Size based on average CPU usage from load testing — not peak, not guess.
+    cpu: 100m
+    # memory: Guaranteed memory allocation. Set equal to or slightly below limits
+    # to ensure predictable scheduling without excessive waste.
+    memory: 128Mi
+  limits:
+    # cpu: Maximum CPU. Process is throttled (not killed) when this is hit.
+    # Set 3-5x the request to allow burst without causing starvation.
+    cpu: 500m
+    # memory: Maximum memory. Process is OOMKilled when this is exceeded.
+    # Set based on max observed memory + 20% buffer from load testing.
+    memory: 512Mi
+
+autoscaling:
+  # enabled: Set true to deploy a HorizontalPodAutoscaler.
+  enabled: true
+  # minReplicas: HPA will never scale below this number.
+  # Should match replicaCount to avoid drift between the two settings.
+  minReplicas: 2
+  # maxReplicas: HPA will never scale above this number.
+  # Set based on maximum concurrent users from load testing plus headroom.
+  maxReplicas: 10
+  # targetCPUUtilizationPercentage: Scale up when average CPU exceeds this %.
+  # 70% leaves headroom for traffic spikes before new pods are ready.
+  targetCPUUtilizationPercentage: 70
+  # targetMemoryUtilizationPercentage: Scale up when average memory exceeds this %.
+  targetMemoryUtilizationPercentage: 80
+
+podDisruptionBudget:
+  # enabled: Set true to create a PodDisruptionBudget.
+  # Prevents all pods from being evicted simultaneously during node drains.
+  enabled: true
+  # minAvailable: Minimum number of pods that must remain available at all times.
+  # For a 2-replica deployment, 1 means one pod can be drained at a time.
+  minAvailable: 1
+
+livenessProbe:
+  httpGet:
+    # path: HTTP path that returns 200 when the application is alive.
+    # A 200 response restores traffic; non-200 triggers a container restart.
+    path: /health
+    port: 8080
+  # initialDelaySeconds: Time to wait before first probe after container starts.
+  # Allow time for JVM warmup, database connections, etc.
+  initialDelaySeconds: 30
+  # periodSeconds: How often to run the probe.
+  periodSeconds: 10
+  # failureThreshold: How many consecutive failures before container is restarted.
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    # path: HTTP path that returns 200 only when the app can serve traffic.
+    # Unlike liveness, readiness failure removes the pod from load balancer rotation
+    # without restarting it — useful for circuit breaking or warm-up states.
+    path: /ready
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  failureThreshold: 3
+
+startupProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  # initialDelaySeconds: Short delay — startup probe fires quickly but allows
+  # more total time via failureThreshold before giving up.
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  # failureThreshold: 30 * 10s = 300s (5 minutes) maximum startup time.
+  # Prevents liveness probe from killing a slow-starting Java/Spring app.
+  failureThreshold: 30
+
+networkPolicy:
+  # enabled: Create a NetworkPolicy that denies all ingress except allowed sources.
+  # Always enable in production — zero-trust between namespaces.
+  enabled: true
+  # ingress: List of allowed ingress sources for the NetworkPolicy.
+  # Default allows only traffic from the ingress-nginx namespace.
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+
+secretsStoreCsi:
+  # enabled: Set true to mount secrets from AWS Secrets Manager as files
+  # using the Secrets Store CSI Driver. Requires the driver to be installed.
+  enabled: false
+  # provider: CSI driver provider. 'aws' for Secrets Manager / Parameter Store.
+  provider: aws
+  # secretProviderClass: Name of the SecretProviderClass custom resource that
+  # defines which secrets to mount and where. Must exist before pod starts.
+  secretProviderClass: ""
+  # volumes: Additional volume definitions for CSI secret mounts.
+  volumes: []
+  # volumeMounts: Volume mount definitions to attach CSI secret volumes to the container.
+  volumeMounts: []
+
+# topologySpreadConstraints: Distribute pods evenly across AZs and nodes.
+# Prevents all pods from landing on one AZ or one node — critical for HA.
+topologySpreadConstraints:
+  - maxSkew: 1
+    # topologyKey: topology.kubernetes.io/zone spreads pods across AWS AZs.
+    topologyKey: topology.kubernetes.io/zone
+    # DoNotSchedule: Hard constraint — pod stays Pending if spread cannot be met.
+    whenUnsatisfiable: DoNotSchedule
+  - maxSkew: 1
+    # kubernetes.io/hostname spreads pods across individual nodes.
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: DoNotSchedule
+
+affinity:
+  podAntiAffinity:
+    # preferredDuringSchedulingIgnoredDuringExecution: Soft anti-affinity —
+    # scheduler prefers to place pods on different nodes but won't block scheduling.
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - microservice
+          topologyKey: kubernetes.io/hostname
+
+lifecycle:
+  preStop:
+    exec:
+      # command: Sleep 5 seconds before container stops.
+      # Allows the load balancer to deregister this pod and drain connections
+      # before SIGTERM is sent. Prevents 502 errors during rolling updates.
+      command: ["/bin/sh", "-c", "sleep 5"]
+
+# terminationGracePeriodSeconds: Time Kubernetes waits after SIGTERM before SIGKILL.
+# Must be greater than your application's shutdown time + preStop sleep.
+terminationGracePeriodSeconds: 30
+
+# env: Additional environment variables as a list of name/value pairs.
+# Example: [{name: LOG_LEVEL, value: info}]
+env: []
+
+# envFrom: Inject all keys from a ConfigMap or Secret as environment variables.
+# Example: [{configMapRef: {name: my-config}}, {secretRef: {name: my-secret}}]
+envFrom: []
+
+# nodeSelector: Schedule pods only on nodes with these labels.
+# Example: {node-type: application}
+nodeSelector: {}
+
+# tolerations: Allow pods to schedule on nodes with matching taints.
+# Example: [{key: dedicated, operator: Equal, value: app, effect: NoSchedule}]
+tolerations: []

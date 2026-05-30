@@ -1,0 +1,35 @@
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# Documentation
+*.md
+
+# Test files
+tests/
+test/
+*_test.yaml
+*_test.go
+
+# CI/CD files
+.gitlab-ci*.yml
+Jenkinsfile
+.github/
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+Thumbs.db
+
+# Development values overrides — values-*.yaml excludes values-production.yaml etc.
+# values.yaml is kept (values-*.yaml requires a literal dash — no match on values.yaml).
+values-*.yaml
+
+# Temporary and backup files
+*.tmp
+*.bak
+*.orig

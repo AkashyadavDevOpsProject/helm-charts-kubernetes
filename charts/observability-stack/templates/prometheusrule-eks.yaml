@@ -1,0 +1,164 @@
+{{- if .Values.prometheus.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "observability-stack.fullname" . }}-eks-rules
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "observability-stack.labels" . | nindent 4 }}
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+    - name: eks-nodes
+      interval: 30s
+      rules:
+        - alert: EKSNodeCPUHigh
+          expr: |
+            100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "EKS node CPU usage is high"
+            description: "Node {{ "{{" }} $labels.instance {{ "}}" }} CPU usage is above 85% (current: {{ "{{" }} $value | printf \"%.1f\" {{ "}}" }}%)"
+            runbook_url: "https://github.com/AkashyadavDevOpsProject/helm-charts-kubernetes/blob/main/docs/runbooks/eks-node-cpu-high.md"
+
+        - alert: EKSNodeMemoryHigh
+          expr: |
+            100 - ((node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100) > 90
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "EKS node memory usage is critically high"
+            description: "Node {{ "{{" }} $labels.instance {{ "}}" }} memory usage is above 90% (current: {{ "{{" }} $value | printf \"%.1f\" {{ "}}" }}%)"
+            runbook_url: "https://github.com/AkashyadavDevOpsProject/helm-charts-kubernetes/blob/main/docs/runbooks/eks-node-memory-high.md"
+
+        - alert: EKSNodeDiskPressure
+          expr: |
+            kube_node_status_condition{condition="DiskPressure",status="true"} == 1
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "EKS node has disk pressure"
+            description: "Node {{ "{{" }} $labels.node {{ "}}" }} is under disk pressure — pods may be evicted."
+
+    - name: eks-pods
+      interval: 30s
+      rules:
+        - alert: PodCrashLooping
+          expr: |
+            rate(kube_pod_container_status_restarts_total[15m]) * 60 > 0
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Pod is crash looping"
+            description: "Pod {{ "{{" }} $labels.namespace {{ "}}" }}/{{ "{{" }} $labels.pod {{ "}}" }} container {{ "{{" }} $labels.container {{ "}}" }} is restarting frequently."
+            runbook_url: "https://github.com/AkashyadavDevOpsProject/helm-charts-kubernetes/blob/main/docs/runbooks/pod-crash-looping.md"
+
+        - alert: PodNotReady
+          expr: |
+            kube_pod_status_ready{condition="false"} == 1
+          for: 10m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Pod has been not ready for 10 minutes"
+            description: "Pod {{ "{{" }} $labels.namespace {{ "}}" }}/{{ "{{" }} $labels.pod {{ "}}" }} has been in a non-ready state for more than 10 minutes."
+
+        - alert: ContainerOOMKilled
+          expr: |
+            kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1
+          for: 0m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Container was OOMKilled"
+            description: "Container {{ "{{" }} $labels.container {{ "}}" }} in pod {{ "{{" }} $labels.namespace {{ "}}" }}/{{ "{{" }} $labels.pod {{ "}}" }} was killed due to out-of-memory. Increase memory limits."
+
+    - name: eks-storage
+      interval: 60s
+      rules:
+        - alert: PVCUsageHigh
+          expr: |
+            (kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes) * 100 > 80
+          for: 10m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "PVC usage is above 80%"
+            description: "PVC {{ "{{" }} $labels.namespace {{ "}}" }}/{{ "{{" }} $labels.persistentvolumeclaim {{ "}}" }} is {{ "{{" }} $value | printf \"%.1f\" {{ "}}" }}% full."
+            runbook_url: "https://github.com/AkashyadavDevOpsProject/helm-charts-kubernetes/blob/main/docs/runbooks/pvc-usage-high.md"
+
+        - alert: PVCUsageCritical
+          expr: |
+            (kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes) * 100 > 95
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "PVC usage is critically high — service may fail"
+            description: "PVC {{ "{{" }} $labels.namespace {{ "}}" }}/{{ "{{" }} $labels.persistentvolumeclaim {{ "}}" }} is {{ "{{" }} $value | printf \"%.1f\" {{ "}}" }}% full. Immediate action required."
+
+    - name: aws-rds
+      interval: 60s
+      rules:
+        - alert: AuroraReplicationLagHigh
+          expr: |
+            aws_rds_replica_lag_average > 30
+          for: 2m
+          labels:
+            severity: critical
+            team: data
+          annotations:
+            summary: "Aurora replica lag is above 30 seconds"
+            description: "Aurora cluster {{ "{{" }} $labels.dbinstance_identifier {{ "}}" }} replication lag is {{ "{{" }} $value | printf \"%.1f\" {{ "}}" }}s. Read replicas may be serving stale data."
+            runbook_url: "https://github.com/AkashyadavDevOpsProject/helm-charts-kubernetes/blob/main/docs/runbooks/aurora-replication-lag.md"
+
+        - alert: AuroraConnectionsHigh
+          expr: |
+            aws_rds_database_connections_average > 900
+          for: 5m
+          labels:
+            severity: warning
+            team: data
+          annotations:
+            summary: "Aurora database connection count is high"
+            description: "Aurora instance {{ "{{" }} $labels.dbinstance_identifier {{ "}}" }} has {{ "{{" }} $value {{ "}}" }} active connections. Consider tuning PgBouncer pool sizes."
+
+    - name: rabbitmq
+      interval: 30s
+      rules:
+        - alert: RabbitMQQueueDepthHigh
+          expr: |
+            rabbitmq_queue_messages > 1000
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "RabbitMQ queue depth is above 1000 messages"
+            description: "Queue {{ "{{" }} $labels.queue {{ "}}" }} on {{ "{{" }} $labels.instance {{ "}}" }} has {{ "{{" }} $value {{ "}}" }} messages. Consumer may be lagging or down."
+
+        - alert: RabbitMQQueueDepthCritical
+          expr: |
+            rabbitmq_queue_messages > 10000
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "RabbitMQ queue depth is critically high"
+            description: "Queue {{ "{{" }} $labels.queue {{ "}}" }} on {{ "{{" }} $labels.instance {{ "}}" }} has {{ "{{" }} $value {{ "}}" }} messages. Consumer is likely down."
+{{- end }}

@@ -1,0 +1,17 @@
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "devsecops-pipeline.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "devsecops-pipeline.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "devsecops-pipeline.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "devsecops-pipeline.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

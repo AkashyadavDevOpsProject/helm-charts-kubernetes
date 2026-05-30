@@ -1,0 +1,134 @@
+{{- if .Values.gitlab.runner.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "devsecops-pipeline.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "devsecops-pipeline.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.gitlab.runner.replicas }}
+  selector:
+    matchLabels:
+      {{- include "devsecops-pipeline.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "devsecops-pipeline.labels" . | nindent 8 }}
+      {{- if .Values.vault.agent.enabled }}
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: {{ .Values.vault.agent.role | quote }}
+        vault.hashicorp.com/agent-pre-populate-only: "false"
+        {{- if .Values.vault.agent.namespace }}
+        vault.hashicorp.com/namespace: {{ .Values.vault.agent.namespace | quote }}
+        {{- end }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "devsecops-pipeline.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: 3600
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "devsecops-pipeline.fullname" . }}-config
+        - name: tmp
+          emptyDir:
+            medium: Memory
+        - name: home
+          emptyDir: {}
+      containers:
+        - name: gitlab-runner
+          image: "{{ .Values.gitlab.runner.image.registry }}/{{ .Values.gitlab.runner.image.image }}:{{ .Values.gitlab.runner.image.tag }}"
+          imagePullPolicy: {{ .Values.gitlab.runner.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              cp /config/config.toml /tmp/config.toml
+              gitlab-runner run --working-directory /home/gitlab-runner \
+                --config /tmp/config.toml \
+                --user gitlab-runner
+          env:
+            - name: REGISTRATION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "devsecops-pipeline.runnerSecretName" . }}
+                  key: runner-token
+            - name: CI_SERVER_URL
+              value: {{ .Values.gitlab.runner.gitlabUrl | quote }}
+            - name: RUNNER_EXECUTOR
+              value: kubernetes
+            - name: KUBERNETES_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: home
+              mountPath: /home/gitlab-runner
+          resources:
+            {{- toYaml .Values.gitlab.runner.resources | nindent 12 }}
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - gitlab-runner verify --name $(hostname) 2>/dev/null || true
+            initialDelaySeconds: 60
+            periodSeconds: 60
+            failureThreshold: 3
+      {{- if .Values.vault.agent.enabled }}
+        - name: vault-agent
+          image: "{{ .Values.vault.agent.image.repository }}:{{ .Values.vault.agent.image.tag }}"
+          imagePullPolicy: {{ .Values.vault.agent.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 100
+            capabilities:
+              drop:
+                - ALL
+          args:
+            - agent
+            - -config=/vault/config/agent.hcl
+          env:
+            - name: VAULT_ADDR
+              value: {{ required "vault.agent.address is required when vault.agent.enabled is true" .Values.vault.agent.address | quote }}
+            - name: SKIP_SETCAP
+              value: "true"
+          volumeMounts:
+            - name: vault-agent-config
+              mountPath: /vault/config
+              readOnly: true
+            - name: vault-secrets
+              mountPath: /vault/secrets
+          resources:
+            {{- toYaml .Values.vault.agent.resources | nindent 12 }}
+      {{- end }}
+      {{- if .Values.vault.agent.enabled }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "devsecops-pipeline.fullname" . }}-config
+        - name: tmp
+          emptyDir:
+            medium: Memory
+        - name: home
+          emptyDir: {}
+        - name: vault-agent-config
+          configMap:
+            name: {{ include "devsecops-pipeline.fullname" . }}-vault-agent
+        - name: vault-secrets
+          emptyDir:
+            medium: Memory
+      {{- end }}
+{{- end }}

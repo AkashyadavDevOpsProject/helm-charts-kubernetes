@@ -1,0 +1,137 @@
+{{- if .Values.opa.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "devsecops-pipeline.fullname" . }}-opa-policies
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "devsecops-pipeline.labels" . | nindent 4 }}
+data:
+  {{- if .Values.opa.policies.requireNonRootUser }}
+  require-non-root-user.rego: |
+    # METADATA
+    # title: Require Non-Root User
+    # description: Containers must not run as root (UID 0). Enforced across all namespaces.
+    # custom:
+    #   enforcement: deny
+    package kubernetes.admission.require_non_root_user
+
+    import future.keywords.contains
+    import future.keywords.if
+
+    violation contains msg if {
+      input.request.kind.kind == "Pod"
+      container := input.request.object.spec.containers[_]
+      not container.securityContext.runAsNonRoot
+      msg := sprintf("Container '%v' must set securityContext.runAsNonRoot: true", [container.name])
+    }
+
+    violation contains msg if {
+      input.request.kind.kind == "Pod"
+      container := input.request.object.spec.containers[_]
+      container.securityContext.runAsUser == 0
+      msg := sprintf("Container '%v' must not run as UID 0 (root)", [container.name])
+    }
+  {{- end }}
+
+  {{- if .Values.opa.policies.requireReadOnlyRootFS }}
+  require-readonly-rootfs.rego: |
+    # METADATA
+    # title: Require Read-Only Root Filesystem
+    # description: Containers must mount their root filesystem as read-only.
+    # custom:
+    #   enforcement: deny
+    package kubernetes.admission.require_readonly_rootfs
+
+    import future.keywords.contains
+    import future.keywords.if
+
+    violation contains msg if {
+      input.request.kind.kind == "Pod"
+      container := input.request.object.spec.containers[_]
+      not container.securityContext.readOnlyRootFilesystem
+      msg := sprintf("Container '%v' must set securityContext.readOnlyRootFilesystem: true", [container.name])
+    }
+  {{- end }}
+
+  {{- if .Values.opa.policies.blockLatestTag }}
+  block-latest-tag.rego: |
+    # METADATA
+    # title: Block :latest Image Tag
+    # description: Image tags must be pinned. Using :latest prevents reproducible deploys.
+    # custom:
+    #   enforcement: deny
+    package kubernetes.admission.block_latest_tag
+
+    import future.keywords.contains
+    import future.keywords.if
+
+    violation contains msg if {
+      input.request.kind.kind == "Pod"
+      container := input.request.object.spec.containers[_]
+      endswith(container.image, ":latest")
+      msg := sprintf("Container '%v' uses ':latest' tag. Pin to an immutable tag (commit SHA).", [container.name])
+    }
+
+    violation contains msg if {
+      input.request.kind.kind == "Pod"
+      container := input.request.object.spec.containers[_]
+      not contains(container.image, ":")
+      msg := sprintf("Container '%v' has no image tag. All images must use an explicit, immutable tag.", [container.name])
+    }
+  {{- end }}
+
+  {{- if .Values.opa.policies.requireResourceLimits }}
+  require-resource-limits.rego: |
+    # METADATA
+    # title: Require CPU and Memory Limits
+    # description: All containers must define CPU and memory limits to prevent resource exhaustion.
+    # custom:
+    #   enforcement: deny
+    package kubernetes.admission.require_resource_limits
+
+    import future.keywords.contains
+    import future.keywords.if
+
+    violation contains msg if {
+      input.request.kind.kind == "Pod"
+      container := input.request.object.spec.containers[_]
+      not container.resources.limits.cpu
+      msg := sprintf("Container '%v' must set resources.limits.cpu", [container.name])
+    }
+
+    violation contains msg if {
+      input.request.kind.kind == "Pod"
+      container := input.request.object.spec.containers[_]
+      not container.resources.limits.memory
+      msg := sprintf("Container '%v' must set resources.limits.memory", [container.name])
+    }
+  {{- end }}
+
+  {{- if .Values.opa.policies.requireTrustedRegistry }}
+  require-trusted-registry.rego: |
+    # METADATA
+    # title: Require Trusted Container Registry
+    # description: Images must originate from approved registries only.
+    # custom:
+    #   enforcement: deny
+    package kubernetes.admission.require_trusted_registry
+
+    import future.keywords.contains
+    import future.keywords.if
+
+    trusted_registries := {{ .Values.opa.policies.trustedRegistries | toJson }}
+
+    is_trusted(image) if {
+      prefix := trusted_registries[_]
+      startswith(image, prefix)
+    }
+
+    violation contains msg if {
+      input.request.kind.kind == "Pod"
+      container := input.request.object.spec.containers[_]
+      not is_trusted(container.image)
+      msg := sprintf("Container '%v' image '%v' is not from a trusted registry. Allowed: %v", [container.name, container.image, trusted_registries])
+    }
+  {{- end }}
+{{- end }}

@@ -1,0 +1,27 @@
+apiVersion: v2
+name: microservice
+description: |
+  Production-ready Helm chart for deploying any microservice on Amazon EKS.
+  Includes HPA, PodDisruptionBudget, ServiceAccount with IRSA annotation,
+  readiness/liveness/startup probes, NetworkPolicy, Secrets Store CSI Driver
+  volume support, and topology spread constraints for HA across AZs.
+  Battle-tested across FinTech payment platforms processing real-money transactions.
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - microservice
+  - eks
+  - kubernetes
+  - hpa
+  - irsa
+  - networkpolicy
+  - fintech
+  - production
+home: https://github.com/AkashyadavDevOpsProject/helm-charts-kubernetes
+sources:
+  - https://github.com/AkashyadavDevOpsProject/helm-charts-kubernetes/tree/main/charts/microservice
+maintainers:
+  - name: Akash Yadav
+    email: akashyadavdevops@gmail.com
+    url: https://linkedin.com/in/akash-yadav-devops

@@ -1,0 +1,134 @@
+# ==============================================================================
+# dr-failover-controller — Production DR values for FinTech multi-region setup
+# Primary: ap-south-1 (Mumbai) | DR: ap-south-2 (Hyderabad)
+# RPO: < 3 hours | RTO: < 30 minutes
+#
+# Deploy:
+#   helm upgrade --install dr-controller akashyadav/dr-failover-controller \
+#     --namespace dr \
+#     --create-namespace \
+#     -f charts/dr-failover-controller/values-production.yaml \
+#     --set controller.healthChecks.primary.endpoint=$PRIMARY_HEALTH_ENDPOINT \
+#     --set controller.healthChecks.aurora.clusterIdentifier=$AURORA_CLUSTER_ID \
+#     --set controller.failover.route53.hostedZoneId=$ROUTE53_ZONE_ID \
+#     --set controller.failover.route53.primaryRecordName=$PRIMARY_DNS_RECORD \
+#     --set controller.failover.route53.drRecordName=$DR_DNS_RECORD \
+#     --set controller.failover.sns.topicArn=$DR_SNS_TOPIC_ARN \
+#     --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=$DR_IRSA_ROLE_ARN \
+#     --atomic --timeout 5m
+#
+# IMPORTANT: Test the failover procedure in staging before first production deploy.
+# Run: kubectl exec -n dr POD -- /scripts/execute-failover.sh (staging cluster first)
+# ==============================================================================
+
+controller:
+  enabled: true
+
+  # replicaCount: 2 — HA for the controller itself.
+  # If one controller pod is evicted, health checks continue from the other.
+  replicaCount: 2
+
+  image:
+    repository: amazon/aws-cli
+    # 2.15.0: pinned to avoid unexpected behaviour changes from AWS CLI updates.
+    # aws route53 and aws sns API calls are stable but minor version changes
+    # can alter output format which the health check scripts parse.
+    tag: "2.15.0"
+    pullPolicy: IfNotPresent
+
+  # schedule: every 3 minutes in production — faster detection than default 5m.
+  # 3 failures × 3 minutes = 9 minute worst-case detection time.
+  # 5m default gives 15m detection — too slow for payment platform SLA.
+  schedule: "*/3 * * * *"
+
+  healthChecks:
+    primary:
+      # endpoint: payment platform primary API health endpoint.
+      endpoint: ""  # Set via --set or GitLab CI/CD variable ($PRIMARY_HEALTH_ENDPOINT)
+      expectedStatusCode: 200
+      # timeoutSeconds: 15 — slightly more lenient than default 10s.
+      # ap-south-1 to ap-south-2 cross-region checks can spike to 12s during congestion.
+      timeoutSeconds: 15
+      # consecutiveFailures: 3 — require 3 failures (9 minutes) before triggering.
+      # Single failures may be transient network blips — 3 consecutive = genuine outage.
+      consecutiveFailures: 3
+
+    aurora:
+      # checkEnabled: true — Aurora replication lag is a leading indicator of DR readiness.
+      # If the DR replica is >30s behind, failing over will cause data loss.
+      checkEnabled: true
+      replicationLagThresholdSeconds: 30
+      # clusterIdentifier: Aurora global database cluster in ap-south-1.
+      clusterIdentifier: ""  # Set via --set or GitLab CI/CD variable ($AURORA_CLUSTER_ID)
+
+    elasticache:
+      # checkEnabled: true — payment session cache; if unavailable in DR region,
+      # users must re-authenticate after failover (acceptable for RTO 30min SLA).
+      checkEnabled: true
+      # primaryEndpoint: Redis cluster endpoint for payment session storage.
+      primaryEndpoint: ""  # Set via --set or GitLab CI/CD variable ($ELASTICACHE_ENDPOINT)
+
+  failover:
+    route53:
+      # hostedZoneId: Route 53 zone hosting the payment platform DNS records.
+      hostedZoneId: ""  # Set via --set or GitLab CI/CD variable ($ROUTE53_ZONE_ID)
+      primaryRecordName: ""  # Set via --set e.g. api.cashinvoice.in
+      drRecordName: ""       # Set via --set e.g. api-dr.cashinvoice.in
+
+      # autoFailover: false — CRITICAL DECISION.
+      # Automated DNS failover without human approval is too risky for a payment platform.
+      # A false positive would route all traffic to DR before the region is verified ready.
+      # Manual approval via SNS → on-call engineer → execute-failover.sh.
+      autoFailover: false
+
+      # requireManualApproval: true — on-call engineer receives SNS alert and must
+      # exec into the controller pod to trigger failover after verifying DR readiness.
+      requireManualApproval: true
+
+    sns:
+      enabled: true
+      # topicArn: SNS topic subscribed by the on-call rotation (PagerDuty integration).
+      topicArn: ""  # Set via --set or GitLab CI/CD variable ($DR_SNS_TOPIC_ARN)
+      alertOnHealthCheckFail: true
+      alertOnFailoverTrigger: true
+      alertOnDRActivation: true
+
+  aws:
+    # region: primary region where this controller runs.
+    region: "ap-south-1"
+    # drRegion: ap-south-2 (Hyderabad) — nearest AWS region to ap-south-1.
+    # Low Aurora replication lag (~5ms typical) between these regions.
+    drRegion: "ap-south-2"
+    # roleArn: set via serviceAccount.annotations IRSA — not here.
+    roleArn: ""
+
+serviceAccount:
+  create: true
+  # IRSA role permissions required:
+  #   route53:ChangeResourceRecordSets on the hosted zone
+  #   route53:ListResourceRecordSets on the hosted zone
+  #   sns:Publish on the DR alerts topic
+  #   rds:DescribeDBClusters on the Aurora cluster
+  #   elasticache:DescribeReplicationGroups
+  annotations: {}  # Set via --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=ARN
+  name: ""
+
+rbac:
+  create: true
+
+metrics:
+  enabled: true
+  port: 9090
+  serviceMonitor:
+    enabled: true
+    # 30s interval: matches the Prometheus scrape interval for the monitoring namespace.
+    # DR status metrics include consecutive_failures counter and failover_state.
+    interval: 30s
+
+grafana:
+  dashboard:
+    # enabled: true — DR status dashboard is visible to on-call engineers in Grafana.
+    # Provides at-a-glance view of primary health and failure counter trend.
+    enabled: true
+    labels:
+      grafana_dashboard: "1"
